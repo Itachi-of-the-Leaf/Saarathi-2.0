@@ -40,6 +40,7 @@ from database import (
     utc_now_iso,
 )
 from proof_gate import GitHubVerifier
+from risk_engine import RiskEngine
 
 load_dotenv()
 
@@ -60,9 +61,55 @@ TICKER_INTERVAL = int(os.getenv("TICKER_INTERVAL_SECONDS", "60"))
 OUTBOX_POLL_INTERVAL = float(os.getenv("OUTBOX_POLL_INTERVAL_SECONDS", "2.0"))
 
 # LLM Conversational Intake configuration
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
-LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1")).rstrip("/")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", os.getenv("LLM_API_KEY", ""))
+LLM_BASE_URL = OPENAI_API_BASE
+LLM_API_KEY = OPENAI_API_KEY
 LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-4o-mini")
+
+
+def sanitize_public_output(text: str) -> str:
+    """
+    Scrub sensitive credentials (GitHub PATs, OpenAI/LLM keys, Bearer tokens)
+    from public room messages.
+    """
+    if not text:
+        return text
+    # 1. GitHub classic & fine-grained PATs
+    text = re.sub(r"ghp_[a-zA-Z0-9]{20,}", "[REDACTED_API_KEY]", text)
+    text = re.sub(r"github_pat_[a-zA-Z0-9_]{20,}", "[REDACTED_API_KEY]", text)
+    # 2. OpenAI / OpenRouter sk- keys
+    text = re.sub(r"sk-[a-zA-Z0-9_\-]{20,}", "[REDACTED_API_KEY]", text)
+    # 3. Bearer tokens
+    text = re.sub(r"Bearer\s+[a-zA-Z0-9_\-\.]{20,}", "Bearer [REDACTED_API_KEY]", text, flags=re.IGNORECASE)
+    return text
+
+
+def parse_due_date(due_str: Optional[str]) -> Optional[str]:
+    """Parse ISO 8601 or relative deadline strings into UTC ISO string."""
+    if not due_str or not isinstance(due_str, str):
+        return None
+    due_str = due_str.strip()
+    try:
+        dt = datetime.fromisoformat(due_str.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat()
+    except Exception:
+        pass
+
+    now = datetime.now(timezone.utc)
+    m_h = re.search(r"(?:in\s+)?(\d+(?:\.\d+)?)\s*(?:h|hr|hours?)", due_str, re.IGNORECASE)
+    if m_h:
+        return (now + timedelta(hours=float(m_h.group(1)))).isoformat()
+    m_m = re.search(r"(?:in\s+)?(\d+)\s*(?:m|min|mins|minutes?)", due_str, re.IGNORECASE)
+    if m_m:
+        return (now + timedelta(minutes=int(m_m.group(1)))).isoformat()
+    m_d = re.search(r"(?:in\s+)?(\d+)\s*(?:d|days?)", due_str, re.IGNORECASE)
+    if m_d:
+        return (now + timedelta(days=int(m_d.group(1)))).isoformat()
+
+    return None
 
 
 class SwitchAdapter:
@@ -129,9 +176,109 @@ class SwitchAdapter:
             return row["received_cursor"] if row else None
 
 
+def _normalize_intent_result(res: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Ensure consistent fields across legacy and unified schemas."""
+    if not isinstance(res, dict):
+        return res
+    # Ensure task_id and task_ref are synced
+    tid = res.get("task_ref") or res.get("task_id")
+    res["task_ref"] = tid
+    res["task_id"] = tid
+
+    # Sync first task fields if tasks present
+    tasks = res.get("tasks") or []
+    if tasks and isinstance(tasks, list) and len(tasks) > 0 and isinstance(tasks[0], dict):
+        first = tasks[0]
+        if "task_title" not in res or res["task_title"] is None:
+            res["task_title"] = first.get("title")
+        if "expected_scope" not in res or res["expected_scope"] is None:
+            res["expected_scope"] = first.get("scope")
+        if "owner" not in res or res["owner"] is None:
+            res["owner"] = first.get("owner")
+        if "due_at" not in res or res["due_at"] is None:
+            res["due_at"] = first.get("due_at")
+
+    return res
+
+
 def _regex_intent_fallback(clean_text: str) -> Optional[Dict[str, Any]]:
     """Fast regex parser for explicit commands starting with keywords."""
-    # Syntax 1: done / verify / proof <pr_url> [task:<task_id>]
+    # Syntax 1: status / overview / dashboard
+    if re.search(r"^(?:status|overview|dashboard|summary)\b", clean_text, re.IGNORECASE):
+        return {
+            "intent": "STATUS_QUERY",
+            "tasks": [],
+            "pr_url": None,
+            "task_ref": None,
+            "blocker_target": None,
+            "blocker_reason": None,
+            "availability": None,
+            "reassign_to": None,
+        }
+
+    # Syntax 2: reassign <task_id> to <member>
+    reassign_match = re.search(
+        r"^reassign\s+([a-zA-Z0-9_-]+)\s+to\s+([a-zA-Z0-9_@-]+)", clean_text, re.IGNORECASE
+    )
+    if reassign_match:
+        return {
+            "intent": "REASSIGN_TASK",
+            "tasks": [],
+            "pr_url": None,
+            "task_ref": reassign_match.group(1),
+            "blocker_target": None,
+            "blocker_reason": None,
+            "availability": None,
+            "reassign_to": reassign_match.group(2).lstrip("@"),
+        }
+
+    # Syntax 3: afk / unavailable
+    afk_match = re.search(
+        r"^(?:afk|unavailable|offline)(?:\s+(?:for\s+)?(\d+(?:\.\d+)?)\s*(?:h|hr|hours?))?",
+        clean_text,
+        re.IGNORECASE,
+    )
+    if afk_match:
+        hrs = float(afk_match.group(1)) if afk_match.group(1) else None
+        return {
+            "intent": "UPDATE_AVAILABILITY",
+            "tasks": [],
+            "pr_url": None,
+            "task_ref": None,
+            "blocker_target": None,
+            "blocker_reason": None,
+            "availability": {"is_available": False, "duration_hours": hrs},
+            "reassign_to": None,
+        }
+
+    # Syntax 4: available / back / online
+    if re.search(r"^(?:back|available|online)\b", clean_text, re.IGNORECASE):
+        return {
+            "intent": "UPDATE_AVAILABILITY",
+            "tasks": [],
+            "pr_url": None,
+            "task_ref": None,
+            "blocker_target": None,
+            "blocker_reason": None,
+            "availability": {"is_available": True, "duration_hours": None},
+            "reassign_to": None,
+        }
+
+    # Syntax 5: start <task_id>
+    start_match = re.search(r"^start\s+([a-zA-Z0-9_-]+)", clean_text, re.IGNORECASE)
+    if start_match:
+        return {
+            "intent": "START_TASK",
+            "tasks": [],
+            "pr_url": None,
+            "task_ref": start_match.group(1),
+            "blocker_target": None,
+            "blocker_reason": None,
+            "availability": None,
+            "reassign_to": None,
+        }
+
+    # Syntax 6: done / verify / proof <pr_url> [task:<task_id>]
     done_match = re.search(
         r"^(?:done|verify|proof)\s+(https?://github\.com/[^\s]+)(?:\s+(?:for\s+task|task:)?\s*([a-zA-Z0-9_-]+))?",
         clean_text,
@@ -140,28 +287,16 @@ def _regex_intent_fallback(clean_text: str) -> Optional[Dict[str, Any]]:
     if done_match:
         return {
             "intent": "CLAIM_DONE",
-            "task_title": None,
-            "owner": None,
-            "expected_scope": None,
+            "tasks": [],
             "pr_url": done_match.group(1),
-            "task_id": done_match.group(2) if done_match.group(2) else None,
+            "task_ref": done_match.group(2) if done_match.group(2) else None,
+            "blocker_target": None,
             "blocker_reason": None,
+            "availability": None,
+            "reassign_to": None,
         }
 
-    # Syntax 2: start <task_id>
-    start_match = re.search(r"^start\s+([a-zA-Z0-9_-]+)", clean_text, re.IGNORECASE)
-    if start_match:
-        return {
-            "intent": "START_TASK",
-            "task_title": None,
-            "owner": None,
-            "expected_scope": None,
-            "pr_url": None,
-            "task_id": start_match.group(1),
-            "blocker_reason": None,
-        }
-
-    # Syntax 3: block <task_id> [reason:<reason>]
+    # Syntax 7: block <task_id> [reason:<reason>]
     block_match = re.search(
         r"^block\s+([a-zA-Z0-9_-]+)(?:\s+(?:reason:)?(.+))?", clean_text, re.IGNORECASE
     )
@@ -169,134 +304,225 @@ def _regex_intent_fallback(clean_text: str) -> Optional[Dict[str, Any]]:
         reason_txt = block_match.group(2).strip() if block_match.group(2) else "Blocked waiting on dependencies"
         return {
             "intent": "REPORT_BLOCKER",
-            "task_title": None,
-            "owner": None,
-            "expected_scope": None,
+            "tasks": [],
             "pr_url": None,
-            "task_id": block_match.group(1),
+            "task_ref": block_match.group(1),
+            "blocker_target": None,
             "blocker_reason": reason_txt,
+            "availability": None,
+            "reassign_to": None,
         }
 
-    # Syntax 4: unblock <task_id>
+    # Syntax 8: unblock <task_id>
     unblock_match = re.search(r"^unblock\s+([a-zA-Z0-9_-]+)", clean_text, re.IGNORECASE)
     if unblock_match:
         return {
             "intent": "CLEAR_BLOCKER",
-            "task_title": None,
-            "owner": None,
-            "expected_scope": None,
+            "tasks": [],
             "pr_url": None,
-            "task_id": unblock_match.group(1),
+            "task_ref": unblock_match.group(1),
+            "blocker_target": None,
             "blocker_reason": None,
+            "availability": None,
+            "reassign_to": None,
         }
 
-    # Syntax 5: create <title> [scope:<path1,path2>] [owner:<owner>]
+    # Syntax 9: create <title> ...
     create_match = re.search(
-        r"^create\s+(.+?)(?:\s+scope:([^\s]+))?(?:\s+owner:([^\s]+))?$",
+        r"^create\s+(.+?)(?:\s+scope:([^\s]+))?(?:\s+owner:([^\s]+))?(?:\s+due:([^\s]+))?(?:\s+depends:([^\s]+))?$",
         clean_text,
         re.IGNORECASE,
     )
     if create_match:
         scopes = create_match.group(2).split(",") if create_match.group(2) else ["src/**", "tests/**"]
         return {
-            "intent": "CREATE_TASK",
-            "task_title": create_match.group(1).strip(),
-            "owner": create_match.group(3) if create_match.group(3) else None,
-            "expected_scope": scopes,
+            "intent": "CREATE_OR_CHAIN_TASK",
+            "tasks": [
+                {
+                    "title": create_match.group(1).strip(),
+                    "owner": create_match.group(3) if create_match.group(3) else None,
+                    "due_at": create_match.group(4) if create_match.group(4) else None,
+                    "depends_on_title": create_match.group(5) if create_match.group(5) else None,
+                    "scope": scopes,
+                }
+            ],
             "pr_url": None,
-            "task_id": None,
+            "task_ref": None,
+            "blocker_target": None,
             "blocker_reason": None,
+            "availability": None,
+            "reassign_to": None,
         }
 
-    # Check for completed claim without PR URL:
+    # Syntax 10: done without PR URL
     if re.search(r"^(?:done|completed|finished)\b", clean_text, re.IGNORECASE):
-        # Check if PR URL is anywhere in text
-        pr_match = re.search(r"(https?://github\.com/[^\s]+)", clean_text)
+        pr_m = re.search(r"(https?://github\.com/[^\s]+)", clean_text)
+        task_m = re.search(r"(?:task|for\s+task|task:)\s*([a-zA-Z0-9_-]+)", clean_text, re.IGNORECASE)
         return {
             "intent": "CLAIM_DONE",
-            "task_title": None,
-            "owner": None,
-            "expected_scope": None,
-            "pr_url": pr_match.group(1) if pr_match else None,
-            "task_id": None,
+            "tasks": [],
+            "pr_url": pr_m.group(1) if pr_m else None,
+            "task_ref": task_m.group(1) if task_m else None,
+            "blocker_target": None,
             "blocker_reason": None,
+            "availability": None,
+            "reassign_to": None,
         }
 
     return None
 
 
 def _heuristic_intent_fallback(clean_text: str, sender: str) -> Dict[str, Any]:
-    """Fallback heuristic classifier when LLM is unavailable."""
-    # Check for PR URL anywhere
-    pr_match = re.search(r"(https?://github\.com/[^\s/]+/[^\s/]+/pull/\d+)", clean_text)
-    task_match = re.search(r"(?:task|for\s+task|task:)\s*([a-zA-Z0-9_-]+)", clean_text, re.IGNORECASE)
-
+    """Fallback heuristic classifier when LLM is unavailable or fails."""
     lower = clean_text.lower()
-    if any(k in lower for k in ("done", "finished", "completed", "pr ready", "submitted pr", "verify")):
+    pr_match = re.search(r"(https?://github\.com/[^\s/]+/[^\s/]+/pull/\d+)", clean_text)
+    task_match = re.search(r"(?:for\s+task\b|task:|\bfor\b)\s*[:#]?\s*([a-zA-Z0-9_-]+)", clean_text, re.IGNORECASE)
+    task_ref = task_match.group(1) if task_match else None
+
+    # Status query
+    if any(k in lower for k in ("status", "overview", "dashboard", "summary", "god's eye", "how are we doing")):
+        return {
+            "intent": "STATUS_QUERY",
+            "tasks": [],
+            "pr_url": None,
+            "task_ref": None,
+            "blocker_target": None,
+            "blocker_reason": None,
+            "availability": None,
+            "reassign_to": None,
+        }
+
+    # Reassign task
+    reassign_m = re.search(r"reassign\s+([a-zA-Z0-9_-]+)\s+to\s+([a-zA-Z0-9_@-]+)", clean_text, re.IGNORECASE)
+    if reassign_m:
+        return {
+            "intent": "REASSIGN_TASK",
+            "tasks": [],
+            "pr_url": None,
+            "task_ref": reassign_m.group(1),
+            "blocker_target": None,
+            "blocker_reason": None,
+            "availability": None,
+            "reassign_to": reassign_m.group(2).lstrip("@"),
+        }
+
+    # Availability
+    if any(k in lower for k in ("afk", "unavailable", "stepping away", "sick", "offline", "taking a break", "out of office", "ooo")):
+        hrs_m = re.search(r"(\d+(?:\.\d+)?)\s*(?:h|hr|hours?)", clean_text, re.IGNORECASE)
+        hrs = float(hrs_m.group(1)) if hrs_m else None
+        return {
+            "intent": "UPDATE_AVAILABILITY",
+            "tasks": [],
+            "pr_url": None,
+            "task_ref": None,
+            "blocker_target": None,
+            "blocker_reason": None,
+            "availability": {"is_available": False, "duration_hours": hrs},
+            "reassign_to": None,
+        }
+
+    if any(k in lower for k in ("back", "online", "available", "returned")):
+        return {
+            "intent": "UPDATE_AVAILABILITY",
+            "tasks": [],
+            "pr_url": None,
+            "task_ref": None,
+            "blocker_target": None,
+            "blocker_reason": None,
+            "availability": {"is_available": True, "duration_hours": None},
+            "reassign_to": None,
+        }
+
+    # Claim done
+    if any(k in lower for k in ("done", "finished", "completed", "pr ready", "submitted pr", "ready for review", "verify")):
         return {
             "intent": "CLAIM_DONE",
-            "task_title": None,
-            "owner": None,
-            "expected_scope": None,
+            "tasks": [],
             "pr_url": pr_match.group(1) if pr_match else None,
-            "task_id": task_match.group(1) if task_match else None,
+            "task_ref": task_ref,
+            "blocker_target": None,
             "blocker_reason": None,
+            "availability": None,
+            "reassign_to": None,
         }
 
-    if any(k in lower for k in ("unblock", "resolved blocker", "unblocked", "resumed")):
+    # Clear blocker
+    if any(k in lower for k in ("unblock", "resolved blocker", "unblocked", "resumed", "clear blocker")):
         return {
             "intent": "CLEAR_BLOCKER",
-            "task_title": None,
-            "owner": None,
-            "expected_scope": None,
+            "tasks": [],
             "pr_url": None,
-            "task_id": task_match.group(1) if task_match else None,
+            "task_ref": task_ref,
+            "blocker_target": None,
             "blocker_reason": None,
+            "availability": None,
+            "reassign_to": None,
         }
 
-    if any(k in lower for k in ("block", "blocked", "stuck", "waiting for", "waiting on", "dependency issue")):
+    # Report blocker
+    if any(k in lower for k in ("block", "blocked", "stuck", "waiting for", "waiting on", "dependency issue", "holding up")):
+        target_m = re.search(r"@([a-zA-Z0-9_-]+)", clean_text)
+        target = target_m.group(1) if target_m else None
         return {
             "intent": "REPORT_BLOCKER",
-            "task_title": None,
-            "owner": None,
-            "expected_scope": None,
+            "tasks": [],
             "pr_url": None,
-            "task_id": task_match.group(1) if task_match else None,
+            "task_ref": task_ref,
+            "blocker_target": target,
             "blocker_reason": clean_text,
+            "availability": None,
+            "reassign_to": None,
         }
 
+    # Start task
     if any(k in lower for k in ("start", "working on", "picked up", "begin")):
         return {
             "intent": "START_TASK",
-            "task_title": None,
-            "owner": None,
-            "expected_scope": None,
+            "tasks": [],
             "pr_url": None,
-            "task_id": task_match.group(1) if task_match else None,
+            "task_ref": task_ref,
+            "blocker_target": None,
             "blocker_reason": None,
+            "availability": None,
+            "reassign_to": None,
         }
 
-    if any(k in lower for k in ("create", "add task", "new task", "implement", "build")):
-        # Extract title
-        title_cand = re.sub(r"^(?:create|add task|new task|please implement|implement)\s+", "", clean_text, flags=re.IGNORECASE)
+    # Create / Chain task
+    if any(k in lower for k in ("create", "add task", "new task", "implement", "build", "chain")):
+        title_cand = re.sub(
+            r"^(?:create|add task|new task|please implement|implement)\s+",
+            "",
+            clean_text,
+            flags=re.IGNORECASE,
+        ).strip()
         return {
-            "intent": "CREATE_TASK",
-            "task_title": title_cand.strip(),
-            "owner": sender,
-            "expected_scope": ["src/**", "tests/**"],
+            "intent": "CREATE_OR_CHAIN_TASK",
+            "tasks": [
+                {
+                    "title": title_cand,
+                    "owner": sender,
+                    "due_at": None,
+                    "depends_on_title": None,
+                    "scope": ["src/**", "tests/**"],
+                }
+            ],
             "pr_url": None,
-            "task_id": None,
+            "task_ref": None,
+            "blocker_target": None,
             "blocker_reason": None,
+            "availability": None,
+            "reassign_to": None,
         }
 
     return {
         "intent": "CHAT",
-        "task_title": None,
-        "owner": None,
-        "expected_scope": None,
+        "tasks": [],
         "pr_url": None,
-        "task_id": None,
+        "task_ref": None,
+        "blocker_target": None,
         "blocker_reason": None,
+        "availability": None,
+        "reassign_to": None,
     }
 
 
@@ -304,10 +530,10 @@ async def parse_conversational_intent(
     text: str, sender: str, http_client: Optional[httpx.AsyncClient] = None
 ) -> Dict[str, Any]:
     """
-    Parse conversational intent from team chat messages addressed to @Saarathi:
-    1. Fast regex fallback if text begins with explicit command keyword.
-    2. Otherwise, calls OpenAI-compatible LLM endpoint with response_format={"type": "json_object"}.
-    3. Falls back gracefully to heuristic classification if LLM is unavailable or fails.
+    Single structured LLM extraction pass for Saarathi 2.0 with fast regex shortcuts.
+    Extracts intents:
+    CREATE_OR_CHAIN_TASK, CLAIM_DONE, REPORT_BLOCKER, CLEAR_BLOCKER,
+    UPDATE_AVAILABILITY, REASSIGN_TASK, STATUS_QUERY, START_TASK, CHAT.
     """
     clean_text = re.sub(r"@saarathi\b", "", text, flags=re.IGNORECASE).strip()
 
@@ -315,39 +541,53 @@ async def parse_conversational_intent(
     fast_parsed = _regex_intent_fallback(clean_text)
     if fast_parsed is not None:
         logger.debug("Fast regex fallback matched: %s", fast_parsed["intent"])
-        return fast_parsed
+        return _normalize_intent_result(fast_parsed)
 
     # If no LLM API key configured, use heuristic fallback immediately
-    if not LLM_API_KEY:
-        logger.debug("LLM_API_KEY unset; using heuristic intake parser")
-        return _heuristic_intent_fallback(clean_text, sender)
+    api_key = os.getenv("OPENAI_API_KEY") or os.getenv("LLM_API_KEY") or OPENAI_API_KEY or LLM_API_KEY
+    base_url = os.getenv("OPENAI_API_BASE") or os.getenv("LLM_BASE_URL") or OPENAI_API_BASE or LLM_BASE_URL
+    if not api_key:
+        logger.debug("No LLM API key configured; using heuristic intake parser")
+        return _normalize_intent_result(_heuristic_intent_fallback(clean_text, sender))
 
     # 2. Call OpenAI-compatible LLM endpoint
     system_prompt = (
-        "You are Saarathi 2.0, a Zero-Trust AI Coordinator for team engineering tasks.\n"
-        "Analyze team chat messages addressed to you and extract structured intent into JSON.\n"
+        "You are Saarathi 2.0, a Zero-Trust AI Coordinator for software teams.\n"
+        "Analyze team chat messages addressed to you and extract structured intent into JSON.\n\n"
         "Allowed Intents:\n"
-        "- CREATE_TASK: User is asking to create, assign, or track a task.\n"
+        "- CREATE_OR_CHAIN_TASK: Create one or multiple tasks, chain dependencies, specify scope, owner, and deadline.\n"
         "- CLAIM_DONE: User claims a task or PR is complete, ready for review, or done.\n"
-        "- REPORT_BLOCKER: User reports a blocker, dependency hold, or obstruction.\n"
-        "- CLEAR_BLOCKER: Blocker is resolved, ready to resume, or unblocked.\n"
-        "- START_TASK: User begins or resumes work on a task.\n"
-        "- CHAT: General greetings, inquiries, or non-actionable remarks.\n\n"
+        "- REPORT_BLOCKER: User reports being blocked, waiting on another member or task.\n"
+        "- CLEAR_BLOCKER: Blocker is resolved, ready to resume.\n"
+        "- UPDATE_AVAILABILITY: User is going AFK/unavailable or returning.\n"
+        "- REASSIGN_TASK: Team lead reassigns a task to another team member.\n"
+        "- STATUS_QUERY: User asks for project status, summary, overview, or God's Eye View.\n"
+        "- START_TASK: User begins working on a task.\n"
+        "- CHAT: General greetings, chit-chat, or questions.\n\n"
         "Output ONLY a valid JSON object matching this schema:\n"
         "{\n"
-        '  "intent": "CREATE_TASK" | "CLAIM_DONE" | "REPORT_BLOCKER" | "CLEAR_BLOCKER" | "START_TASK" | "CHAT",\n'
-        '  "task_title": string or null,\n'
-        '  "owner": string or null,\n'
-        '  "expected_scope": ["path/glob/**", ...] or null,\n'
+        '  "intent": "CREATE_OR_CHAIN_TASK" | "CLAIM_DONE" | "REPORT_BLOCKER" | "CLEAR_BLOCKER" | "UPDATE_AVAILABILITY" | "REASSIGN_TASK" | "STATUS_QUERY" | "START_TASK" | "CHAT",\n'
+        '  "tasks": [\n'
+        '    {\n'
+        '      "title": string,\n'
+        '      "owner": string or null,\n'
+        '      "due_at": string or null,\n'
+        '      "depends_on_title": string or null,\n'
+        '      "scope": ["path/glob/**", ...]\n'
+        '    }\n'
+        '  ],\n'
         '  "pr_url": string or null,\n'
-        '  "task_id": string or null,\n'
-        '  "blocker_reason": string or null\n'
+        '  "task_ref": string or null,\n'
+        '  "blocker_target": string or null,\n'
+        '  "blocker_reason": string or null,\n'
+        '  "availability": {"is_available": boolean, "duration_hours": number or null} or null,\n'
+        '  "reassign_to": string or null\n'
         "}"
     )
 
-    url = f"{LLM_BASE_URL}/chat/completions"
+    url = f"{base_url.rstrip('/')}/chat/completions"
     headers = {
-        "Authorization": f"Bearer {LLM_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
     payload = {
@@ -368,7 +608,7 @@ async def parse_conversational_intent(
             content = resp.json()["choices"][0]["message"]["content"]
             parsed = json.loads(content)
             logger.info("LLM conversational intake extracted: %s", parsed)
-            return parsed
+            return _normalize_intent_result(parsed)
         else:
             logger.warning("LLM API returned %d: %s. Using heuristic fallback.", resp.status_code, resp.text)
     except Exception as e:
@@ -377,7 +617,7 @@ async def parse_conversational_intent(
         if should_close:
             await client.aclose()
 
-    return _heuristic_intent_fallback(clean_text, sender)
+    return _normalize_intent_result(_heuristic_intent_fallback(clean_text, sender))
 
 
 class AuditorEngine:
@@ -387,6 +627,7 @@ class AuditorEngine:
         self.verifier = GitHubVerifier()
         self.coordinator = Coordinator(db_path, verifier=self.verifier)
         self.repo = TaskRepository(db_path)
+        self.risk_engine = RiskEngine(db_path)
 
     # =========================================================================
     # Loop 1: Inbound Switch SSE Listener
@@ -467,38 +708,133 @@ class AuditorEngine:
             intent = intent_data.get("intent", "CHAT")
             logger.info("Parsed intent '%s' for event %s", intent, event_id)
 
-            if intent == "CREATE_TASK":
-                title = intent_data.get("task_title") or text
-                raw_owner = intent_data.get("owner") or actor_id
-                owner_rec = await self.repo.get_member_by_switch_id(raw_owner)
-                owner = owner_rec["member_id"] if owner_rec else raw_owner
-                scopes = intent_data.get("expected_scope") or ["src/**", "tests/**"]
-                tid = await self.coordinator.create_task(
-                    room_id=room_id,
-                    actor_switch_id=actor_id,
-                    title=title,
-                    expected_paths=scopes,
-                    owner_member_id=owner,
-                    source_event_id=event_id,
-                )
-                await self._queue_room_reply(
-                    room_id, f"📋 Task [{tid}] created: '{title}' (Owner: @{owner}) with scope {scopes}"
-                )
+            if intent in ("CREATE_OR_CHAIN_TASK", "CREATE_TASK"):
+                tasks_to_create = intent_data.get("tasks") or []
+                if not tasks_to_create and intent_data.get("task_title"):
+                    tasks_to_create = [
+                        {
+                            "title": intent_data.get("task_title"),
+                            "owner": intent_data.get("owner") or actor_id,
+                            "due_at": intent_data.get("due_at"),
+                            "depends_on_title": None,
+                            "scope": intent_data.get("expected_scope") or ["src/**", "tests/**"],
+                        }
+                    ]
+
+                if not tasks_to_create:
+                    tasks_to_create = [
+                        {
+                            "title": text,
+                            "owner": actor_id,
+                            "due_at": None,
+                            "depends_on_title": None,
+                            "scope": ["src/**", "tests/**"],
+                        }
+                    ]
+
+                created_tasks = []
+                title_to_id = {}
+
+                for spec in tasks_to_create:
+                    title = spec.get("title") or "Untitled task"
+                    raw_owner = spec.get("owner") or actor_id
+                    owner_rec = await self.repo.get_member_by_switch_id(raw_owner)
+                    owner = owner_rec["member_id"] if owner_rec else raw_owner.lower().replace("@", "").replace("sw_", "")
+                    scopes = spec.get("scope") or ["src/**", "tests/**"]
+                    due_at = parse_due_date(spec.get("due_at"))
+
+                    tid = await self.coordinator.create_task(
+                        room_id=room_id,
+                        actor_switch_id=actor_id,
+                        title=title,
+                        expected_paths=scopes,
+                        owner_member_id=owner,
+                        due_at=due_at,
+                        source_event_id=event_id,
+                    )
+                    title_to_id[title.lower()] = tid
+                    created_tasks.append(
+                        {
+                            "task_id": tid,
+                            "title": title,
+                            "owner": owner,
+                            "due_at": due_at,
+                            "depends_on_title": spec.get("depends_on_title"),
+                            "prereq_id": None,
+                        }
+                    )
+
+                # Link dependencies and detect cycles
+                cycle_detected = False
+                cycle_error_msg = ""
+                for t_info in created_tasks:
+                    dep_title = t_info["depends_on_title"]
+                    if dep_title:
+                        prereq_id = title_to_id.get(dep_title.lower())
+                        if not prereq_id:
+                            # Look up in database by title or task_id
+                            async with get_db_reader(self.db_path) as db:
+                                c = await db.execute(
+                                    "SELECT task_id FROM tasks WHERE room_id = ? AND (LOWER(title) LIKE ? OR task_id = ?) LIMIT 1",
+                                    (room_id, f"%{dep_title.lower()}%", dep_title),
+                                )
+                                r = await c.fetchone()
+                                if r:
+                                    prereq_id = r["task_id"]
+                        if prereq_id:
+                            t_info["prereq_id"] = prereq_id
+                            try:
+                                await self.coordinator.set_task_dependencies(
+                                    room_id, actor_id, t_info["task_id"], [prereq_id], source_event_id=event_id
+                                )
+                            except DependencyCycleError as dce:
+                                cycle_detected = True
+                                cycle_error_msg = str(dce)
+                                logger.warning("Dependency cycle detected during chaining: %s", dce)
+
+                if cycle_detected:
+                    msg = (
+                        f"⚠️ **Deadlock Detected!**\n"
+                        f"A cyclic dependency was requested: {cycle_error_msg}\n"
+                        f"Saarathi rejected the dependency cycle to protect execution order.\n"
+                        f"💡 **Mediation Recommendation**: Team members should define and agree on a temporary mock API contract so both owners can develop in parallel without blocking each other."
+                    )
+                    await self._queue_room_reply(room_id, msg)
+                else:
+                    lines = ["📋 **Tasks Created & Chained Successfully:**"]
+                    for t_info in created_tasks:
+                        due_str = f" [Due: {t_info['due_at'][:16]}]" if t_info["due_at"] else ""
+                        dep_str = f"\n  ↳ Depends on: [{t_info['prereq_id']}]" if t_info["prereq_id"] else ""
+                        lines.append(f"• [{t_info['task_id']}] '{t_info['title']}' (Owner: @{t_info['owner']}){due_str}{dep_str}")
+                    await self._queue_room_reply(room_id, "\n".join(lines))
 
             elif intent == "CLAIM_DONE":
                 pr_url = intent_data.get("pr_url")
-                # Strict zero-trust rule: user claims work is complete without PR proof
+                task_ref = intent_data.get("task_ref") or intent_data.get("task_id")
+
+                # Bluff Catcher: user claims done with no GitHub PR URL
                 if not pr_url:
+                    target_name = f"'{task_ref}'" if task_ref else "work"
                     await self._queue_room_reply(
                         room_id,
-                        f"⚠️ @{actor_id}: You claimed work is complete, but provided no GitHub PR proof! "
-                        f"Provide a PR URL or the task remains BLOCKED.",
+                        f"⚠️ @{actor_id}: You claimed {target_name} is complete, but provided no GitHub PR proof (URL)! "
+                        f"Proof is required before completion.",
                     )
                     return
 
-                task_id = intent_data.get("task_id")
+                # Resolve task_id
+                task_id = None
+                if task_ref:
+                    async with get_db_reader(self.db_path) as db:
+                        c = await db.execute(
+                            "SELECT task_id FROM tasks WHERE task_id = ? OR (room_id = ? AND LOWER(title) LIKE ?) LIMIT 1",
+                            (task_ref, room_id, f"%{task_ref.lower()}%"),
+                        )
+                        r = await c.fetchone()
+                        if r:
+                            task_id = r["task_id"]
+
                 if not task_id:
-                    # Look up active in-progress task for this actor
                     member = await self.repo.get_member_by_switch_id(actor_id)
                     if member:
                         async with get_db_reader(self.db_path) as db:
@@ -513,7 +849,7 @@ class AuditorEngine:
                 if not task_id:
                     await self._queue_room_reply(
                         room_id,
-                        f"⚠️ Please specify which task ID this PR completes: `@Saarathi done {pr_url} task:<task_id>`",
+                        f"⚠️ Please specify which task this PR completes: `@Saarathi done {pr_url} task:<task_id>`",
                     )
                     return
 
@@ -526,15 +862,67 @@ class AuditorEngine:
                     inbox_event_key=(room_id, event_id),
                 )
                 logger.info("Verification result for event %s: %s", event_id, res)
-                if res.get("status") == "RETRY_LATER":
+                if res.get("status") == "VERIFIED":
+                    # Check for downstream tasks unblocked by this completion
+                    async with get_db_reader(self.db_path) as db:
+                        c = await db.execute(
+                            """
+                            SELECT t.task_id, t.title, t.owner_member_id
+                            FROM task_dependencies d
+                            JOIN tasks t ON d.task_id = t.task_id
+                            WHERE d.depends_on_task_id = ?
+                            """,
+                            (task_id,),
+                        )
+                        downstreams = await c.fetchall()
+
+                    unblocked_msgs = []
+                    for d in downstreams:
+                        async with get_db_reader(self.db_path) as db:
+                            p_cur = await db.execute(
+                                """
+                                SELECT pt.status
+                                FROM task_dependencies td
+                                JOIN tasks pt ON td.depends_on_task_id = pt.task_id
+                                WHERE td.task_id = ?
+                                """,
+                                (d["task_id"],),
+                            )
+                            p_statuses = [row["status"] for row in await p_cur.fetchall()]
+                        if all(s == "COMPLETE" for s in p_statuses):
+                            unblocked_msgs.append(
+                                f"• Downstream task [{d['task_id']}] '{d['title']}' owned by @{d['owner_member_id']} is now UNBLOCKED!"
+                            )
+
+                    reply = f"🎉 **Proof Verified!** Task [{task_id}] passed all policy and CI checks and is marked COMPLETE."
+                    if unblocked_msgs:
+                        reply += "\n" + "\n".join(unblocked_msgs)
+                    await self._queue_room_reply(room_id, reply)
+
+                elif res.get("status") == "RETRY_LATER":
                     await self._queue_room_reply(
                         room_id,
-                        f"⏳ Proof check pending for task [{task_id}]: {res.get('reason')}. "
-                        f"Task remains in progress; will auto-retry.",
+                        f"⏳ Proof check pending for task [{task_id}]: {res.get('reason')}. Task remains in progress; will auto-retry.",
+                    )
+                elif res.get("status") == "REJECTED":
+                    await self._queue_room_reply(
+                        room_id,
+                        f"❌ Proof REJECTED for task [{task_id}]: {res.get('reason')}. Task remains in progress.",
                     )
 
             elif intent == "START_TASK":
-                task_id = intent_data.get("task_id")
+                task_ref = intent_data.get("task_ref") or intent_data.get("task_id")
+                task_id = None
+                if task_ref:
+                    async with get_db_reader(self.db_path) as db:
+                        c = await db.execute(
+                            "SELECT task_id FROM tasks WHERE task_id = ? OR (room_id = ? AND LOWER(title) LIKE ?) LIMIT 1",
+                            (task_ref, room_id, f"%{task_ref.lower()}%"),
+                        )
+                        r = await c.fetchone()
+                        if r:
+                            task_id = r["task_id"]
+
                 if not task_id:
                     member = await self.repo.get_member_by_switch_id(actor_id)
                     if member:
@@ -546,6 +934,7 @@ class AuditorEngine:
                             row = await cur.fetchone()
                             if row:
                                 task_id = row["task_id"]
+
                 if task_id:
                     await self.coordinator.start_task(room_id, actor_id, task_id, source_event_id=event_id)
                     await self._queue_room_reply(room_id, f"🚀 Task [{task_id}] moved to IN_PROGRESS.")
@@ -553,8 +942,21 @@ class AuditorEngine:
                     await self._queue_room_reply(room_id, "⚠️ Please specify which task to start: `@Saarathi start <task_id>`")
 
             elif intent == "REPORT_BLOCKER":
-                task_id = intent_data.get("task_id")
+                task_ref = intent_data.get("task_ref") or intent_data.get("task_id")
+                target = intent_data.get("blocker_target")
                 reason = intent_data.get("blocker_reason") or "Blocked waiting on dependencies/clarification"
+
+                task_id = None
+                if task_ref:
+                    async with get_db_reader(self.db_path) as db:
+                        c = await db.execute(
+                            "SELECT task_id FROM tasks WHERE task_id = ? OR (room_id = ? AND LOWER(title) LIKE ?) LIMIT 1",
+                            (task_ref, room_id, f"%{task_ref.lower()}%"),
+                        )
+                        r = await c.fetchone()
+                        if r:
+                            task_id = r["task_id"]
+
                 if not task_id:
                     member = await self.repo.get_member_by_switch_id(actor_id)
                     if member:
@@ -566,14 +968,39 @@ class AuditorEngine:
                             row = await cur.fetchone()
                             if row:
                                 task_id = row["task_id"]
-                if task_id:
-                    await self.coordinator.block_task(room_id, actor_id, task_id, reason, source_event_id=event_id)
-                    await self._queue_room_reply(room_id, f"🛑 Task [{task_id}] is now BLOCKED: {reason}")
-                else:
+
+                if not task_id:
                     await self._queue_room_reply(room_id, f"⚠️ Please specify which task is blocked: `@Saarathi block <task_id> {reason}`")
+                    return
+
+                full_reason = f"Waiting on @{target}: {reason}" if target else reason
+                await self.coordinator.block_task(room_id, actor_id, task_id, full_reason, source_event_id=event_id)
+
+                # Calculate Blast Radius using RiskEngine
+                blast = await self.risk_engine.calculate_blocker_blast_radius(task_id)
+                blast_str = ""
+                if blast["total_blocked"] > 0:
+                    owners_tag = ", ".join(f"@{o}" for o in blast["affected_owners"])
+                    blast_str = f"\n💥 **Blast Radius**: {blast['total_blocked']} downstream task(s) impacted (Owners: {owners_tag})."
+
+                if target:
+                    await self._queue_room_reply(room_id, f"🛑 Task [{task_id}] blocked by @{target}: {reason}{blast_str}")
+                else:
+                    await self._queue_room_reply(room_id, f"🛑 Task [{task_id}] is now BLOCKED: {reason}{blast_str}")
 
             elif intent == "CLEAR_BLOCKER":
-                task_id = intent_data.get("task_id")
+                task_ref = intent_data.get("task_ref") or intent_data.get("task_id")
+                task_id = None
+                if task_ref:
+                    async with get_db_reader(self.db_path) as db:
+                        c = await db.execute(
+                            "SELECT task_id FROM tasks WHERE task_id = ? OR (room_id = ? AND LOWER(title) LIKE ?) LIMIT 1",
+                            (task_ref, room_id, f"%{task_ref.lower()}%"),
+                        )
+                        r = await c.fetchone()
+                        if r:
+                            task_id = r["task_id"]
+
                 if not task_id:
                     member = await self.repo.get_member_by_switch_id(actor_id)
                     if member:
@@ -585,16 +1012,143 @@ class AuditorEngine:
                             row = await cur.fetchone()
                             if row:
                                 task_id = row["task_id"]
+
                 if task_id:
                     await self.coordinator.unblock_task(room_id, actor_id, task_id, source_event_id=event_id)
                     await self._queue_room_reply(room_id, f"✅ Task [{task_id}] is UNBLOCKED and IN_PROGRESS.")
                 else:
                     await self._queue_room_reply(room_id, "⚠️ Please specify which task to unblock: `@Saarathi unblock <task_id>`")
 
+            elif intent == "UPDATE_AVAILABILITY":
+                avail = intent_data.get("availability") or {}
+                is_avail = avail.get("is_available", True)
+                dur_hours = avail.get("duration_hours")
+
+                member_rec = await self.repo.get_member_by_switch_id(actor_id)
+                member_id = member_rec["member_id"] if member_rec else actor_id.lower().replace("@", "").replace("sw_", "")
+
+                if not is_avail:
+                    unavail_until = None
+                    dur_str = ""
+                    if dur_hours:
+                        unavail_dt = datetime.now(timezone.utc) + timedelta(hours=dur_hours)
+                        unavail_until = unavail_dt.isoformat()
+                        dur_str = f" for {dur_hours:g} hour(s)"
+                    await self.repo.update_member_availability(member_id, is_available=False, unavailable_until=unavail_until)
+
+                    # Dynamic reallocation of active tasks to lowest-load peer
+                    async with get_db_reader(self.db_path) as db:
+                        c = await db.execute(
+                            "SELECT task_id, title FROM tasks WHERE owner_member_id = ? AND room_id = ? AND status IN ('OPEN', 'IN_PROGRESS') ORDER BY updated_at DESC",
+                            (member_id, room_id),
+                        )
+                        active_tasks = await c.fetchall()
+
+                    if active_tasks:
+                        lowest_peer = await self.repo.get_lowest_load_member(room_id, exclude_member_ids=[member_id])
+                        if lowest_peer:
+                            reassigned_notes = []
+                            for t in active_tasks:
+                                res = await self.repo.reassign_task(
+                                    room_id, t["task_id"], lowest_peer, actor_id=AGENT_ID, source_event_id=event_id
+                                )
+                                reassigned_notes.append(f"• Task [{res['task_id']}] '{res['title']}' $\\to$ @{res['new_owner']}")
+                            reassigned_block = "\n".join(reassigned_notes)
+                            await self._queue_room_reply(
+                                room_id,
+                                f"🛌 @{actor_id} is marked unavailable{dur_str}.\n"
+                                f"Dynamic Reallocation (Lowest-Load Peer @{lowest_peer}):\n{reassigned_block}\n"
+                                f"💡 Note: Team lead @soham can override reassignment if needed.",
+                            )
+                        else:
+                            await self._queue_room_reply(room_id, f"🛌 @{actor_id} is marked unavailable{dur_str}.")
+                    else:
+                        await self._queue_room_reply(room_id, f"🛌 @{actor_id} is marked unavailable{dur_str}.")
+                else:
+                    await self.repo.update_member_availability(member_id, is_available=True, unavailable_until=None)
+                    await self._queue_room_reply(room_id, f"👋 Welcome back @{actor_id}! Marked as AVAILABLE for task assignments.")
+
+            elif intent == "REASSIGN_TASK":
+                # Check authorization: sender must be lead in room_memberships or soham
+                member_rec = await self.repo.get_member_by_switch_id(actor_id)
+                clean_actor = member_rec["member_id"] if member_rec else actor_id.lower().replace("@", "").replace("sw_", "")
+
+                is_lead = False
+                if clean_actor in ("soham", "sw_soham"):
+                    is_lead = True
+                else:
+                    async with get_db_reader(self.db_path) as db:
+                        c = await db.execute(
+                            "SELECT role FROM room_memberships WHERE room_id = ? AND member_id = ? AND active = 1",
+                            (room_id, clean_actor),
+                        )
+                        r = await c.fetchone()
+                        if r and r["role"] == "lead":
+                            is_lead = True
+
+                if not is_lead:
+                    await self._queue_room_reply(room_id, "⚠️ Permission Denied: Only team lead @soham can manually reassign tasks.")
+                    return
+
+                task_ref = intent_data.get("task_ref") or intent_data.get("task_id")
+                target_member = intent_data.get("reassign_to")
+                task_id = None
+                if task_ref:
+                    async with get_db_reader(self.db_path) as db:
+                        c = await db.execute(
+                            "SELECT task_id FROM tasks WHERE task_id = ? OR (room_id = ? AND LOWER(title) LIKE ?) LIMIT 1",
+                            (task_ref, room_id, f"%{task_ref.lower()}%"),
+                        )
+                        r = await c.fetchone()
+                        if r:
+                            task_id = r["task_id"]
+
+                if not task_id or not target_member:
+                    await self._queue_room_reply(room_id, "⚠️ Usage: `@Saarathi reassign <task_id> to <member>`")
+                    return
+
+                res = await self.repo.reassign_task(room_id, task_id, target_member, actor_id=clean_actor, source_event_id=event_id)
+                await self._queue_room_reply(
+                    room_id,
+                    f"🔄 Team Lead @{actor_id} reassigned task [{task_id}] '{res['title']}' from @{res['old_owner']} to @{res['new_owner']}.",
+                )
+
+            elif intent == "STATUS_QUERY":
+                summary = await self.repo.get_status_summary(room_id)
+                lines = ["📊 **Saarathi God's Eye View:**"]
+
+                lines.append(f"\n🟢 **Completed ({len(summary['completed'])}):**")
+                if summary["completed"]:
+                    for t in summary["completed"]:
+                        lines.append(f"• [{t['task_id']}] '{t['title']}' (Owner: @{t['owner_member_id']})")
+                else:
+                    lines.append("  (None)")
+
+                lines.append(f"\n🟡 **In Progress / Open ({len(summary['in_progress'])}):**")
+                if summary["in_progress"]:
+                    for t in summary["in_progress"]:
+                        due_info = f" [Due: {t['due_at'][:16]}]" if t.get("due_at") else ""
+                        lines.append(
+                            f"• [{t['task_id']}] '{t['title']}' (Owner: @{t['owner_member_id']}, Status: {t['status']}){due_info}"
+                        )
+                else:
+                    lines.append("  (None)")
+
+                lines.append(f"\n🔴 **Blocked ({len(summary['blocked'])}):**")
+                if summary["blocked"]:
+                    for t in summary["blocked"]:
+                        lines.append(
+                            f"• [{t['task_id']}] '{t['title']}' (Owner: @{t['owner_member_id']}) - Reason: {t['blocker'] or 'Dependencies'}"
+                        )
+                else:
+                    lines.append("  (None)")
+
+                await self._queue_room_reply(room_id, "\n".join(lines))
+
             elif intent == "CHAT":
                 await self._queue_room_reply(
                     room_id,
-                    f"👋 Hi @{actor_id}! I am Saarathi, your Zero-Trust Auditor. I track tasks and only mark them complete when PR proof passes all policy and CI checks.",
+                    f"👋 Hi @{actor_id}! I am Saarathi, your Zero-Trust Coordinator. I track tasks, verify PR proof, detect deadlocks, and monitor deadlines.",
                 )
 
             # Mark inbox event DONE and advance processed_cursor
@@ -636,7 +1190,8 @@ class AuditorEngine:
                 )
 
     async def _queue_room_reply(self, room_id: str, message: str) -> None:
-        """Queue a message in outbox table."""
+        """Queue a message in outbox table after sanitizing credentials."""
+        sanitized_msg = sanitize_public_output(message)
         async with get_db_writer(self.db_path) as conn:
             out_id = f"out_{uuid.uuid4().hex[:12]}"
             now = utc_now_iso()
@@ -647,7 +1202,7 @@ class AuditorEngine:
                     status, attempts, next_attempt_at, created_at
                 ) VALUES (?, ?, ?, ?, 'READY', 0, ?, ?)
                 """,
-                (out_id, f"reply_{out_id}", room_id, message, now, now),
+                (out_id, f"reply_{out_id}", room_id, sanitized_msg, now, now),
             )
 
     # =========================================================================
@@ -736,7 +1291,7 @@ class AuditorEngine:
         attempts = row["attempts"]
         post_url = f"{SWITCH_BASE_URL}/rooms/{room_id}/messages"
         payload = {
-            "body": row["body"],
+            "body": sanitize_public_output(row["body"]),
             "idempotency_key": row["idempotency_key"],
         }
 
@@ -807,13 +1362,15 @@ class AuditorEngine:
     async def run_periodic_ticker(self, shutdown_event: asyncio.Event) -> None:
         """
         Task 3: Periodic deadline & dependency unblock ticker (every 60s).
-        1. Checks blocked tasks whose prerequisites are now complete.
-        2. Retries verification attempts in RETRY_LATER state.
+        1. Checks deadline reminders and escalations (3-tier Deadline Hound).
+        2. Checks blocked tasks whose prerequisites are now complete.
+        3. Retries verification attempts in RETRY_LATER state.
         """
         logger.info("Starting Periodic Deadline & Unblock Ticker (interval: %ds)", TICKER_INTERVAL)
 
         while not shutdown_event.is_set():
             try:
+                await self._check_deadlines()
                 await self._check_dependency_unblocks()
                 await self._retry_pending_verifications()
             except Exception as e:
@@ -823,6 +1380,87 @@ class AuditorEngine:
                 await asyncio.wait_for(shutdown_event.wait(), timeout=float(TICKER_INTERVAL))
             except asyncio.TimeoutError:
                 pass
+
+    async def _check_deadlines(self) -> None:
+        """
+        3-Tier Deadline Hound:
+        - Tier 1: T - 1h (within 1 hour of deadline): gentle reminder to owner -> tier 1.
+        - Tier 2: T + 0 (past due): overdue alert + downstream peer warnings -> tier 2.
+        - Tier 3: T + 1h (1 hour overdue): escalate to team lead @soham -> tier 3.
+        """
+        async with get_db_reader(self.db_path) as db:
+            cur = await db.execute(
+                """
+                SELECT task_id, room_id, title, owner_member_id, due_at, last_reminded_tier
+                FROM tasks
+                WHERE status IN ('OPEN', 'IN_PROGRESS') AND due_at IS NOT NULL
+                """
+            )
+            active_tasks = await cur.fetchall()
+
+        now = datetime.now(timezone.utc)
+
+        for t in active_tasks:
+            try:
+                due_iso = t["due_at"].replace("Z", "+00:00")
+                due_dt = datetime.fromisoformat(due_iso)
+                if due_dt.tzinfo is None:
+                    due_dt = due_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+
+            tid = t["task_id"]
+            room = t["room_id"]
+            owner = t["owner_member_id"]
+            title = t["title"]
+            tier = t["last_reminded_tier"]
+
+            # Overdue vs upcoming
+            if now > due_dt:
+                overdue_secs = (now - due_dt).total_seconds()
+                if overdue_secs >= 3600 and tier < 3:
+                    logger.warning("Task %s is >1h overdue. Escalating to lead @soham", tid)
+                    await self._queue_room_reply(
+                        room,
+                        f"🔥 **Critical Escalation**: Task [{tid}] '{title}' owned by @{owner} is >1 hour overdue! "
+                        f"Notifying team lead @soham for intervention or reallocation.",
+                    )
+                    await self.repo.update_reminded_tier(tid, 3)
+                elif overdue_secs < 3600 and tier < 2:
+                    logger.warning("Task %s is past due. Alerting owner and downstream peers.", tid)
+                    async with get_db_reader(self.db_path) as db:
+                        c = await db.execute(
+                            """
+                            SELECT DISTINCT pt.owner_member_id
+                            FROM task_dependencies d
+                            JOIN tasks pt ON d.task_id = pt.task_id
+                            WHERE d.depends_on_task_id = ?
+                            """,
+                            (tid,),
+                        )
+                        downstream_rows = await c.fetchall()
+                    downstream_tags = (
+                        ", ".join(f"@{r['owner_member_id']}" for r in downstream_rows)
+                        if downstream_rows
+                        else "None"
+                    )
+
+                    await self._queue_room_reply(
+                        room,
+                        f"🚨 **Overdue Alert**: Task [{tid}] '{title}' owned by @{owner} is now PAST DUE!\n"
+                        f"Heads-up to downstream peers waiting on this task: {downstream_tags}.",
+                    )
+                    await self.repo.update_reminded_tier(tid, 2)
+            else:
+                rem_secs = (due_dt - now).total_seconds()
+                if rem_secs <= 3600 and tier < 1:
+                    mins_left = max(1, int(rem_secs // 60))
+                    logger.info("Task %s is due in %d mins. Sending Tier 1 reminder.", tid, mins_left)
+                    await self._queue_room_reply(
+                        room,
+                        f"⏰ **Heads-up** @{owner}: Task [{tid}] '{title}' is due in {mins_left} minutes!",
+                    )
+                    await self.repo.update_reminded_tier(tid, 1)
 
     async def _check_dependency_unblocks(self) -> None:
         """

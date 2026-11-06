@@ -122,7 +122,9 @@ CREATE TABLE IF NOT EXISTS members (
     member_id TEXT PRIMARY KEY,
     switch_user_id TEXT NOT NULL UNIQUE,
     github_login TEXT UNIQUE,
-    active INTEGER NOT NULL CHECK(active IN (0,1))
+    active INTEGER NOT NULL CHECK(active IN (0,1)),
+    is_available INTEGER NOT NULL DEFAULT 1 CHECK(is_available IN (0,1)),
+    unavailable_until TEXT
 );
 
 -- 2. ROOM MEMBERSHIPS
@@ -179,6 +181,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     expected_paths_json TEXT NOT NULL,
     blocker TEXT,
     active_attempt_id TEXT,
+    due_at TEXT,
+    last_reminded_tier INTEGER NOT NULL DEFAULT 0,
     version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -425,6 +429,19 @@ async def init_db(
             )
             logger.info("Seeded default policy revision #1 for repo %s", default_repo)
 
+        # Backward-compatible column additions for existing databases
+        for col_def in [
+            ("members", "is_available", "INTEGER NOT NULL DEFAULT 1 CHECK(is_available IN (0,1))"),
+            ("members", "unavailable_until", "TEXT"),
+            ("tasks", "due_at", "TEXT"),
+            ("tasks", "last_reminded_tier", "INTEGER NOT NULL DEFAULT 0"),
+        ]:
+            tbl, col, col_type = col_def
+            try:
+                await conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {col_type};")
+            except Exception:
+                pass
+
         # Seed Team Roster: soham (lead), samarth, atharva, parth (members)
         team_roster = [
             ("soham", "soham", "soham", "lead"),
@@ -437,8 +454,8 @@ async def init_db(
         for member_id, switch_id, gh_login, role in team_roster:
             await conn.execute(
                 """
-                INSERT OR IGNORE INTO members (member_id, switch_user_id, github_login, active)
-                VALUES (?, ?, ?, 1)
+                INSERT OR IGNORE INTO members (member_id, switch_user_id, github_login, active, is_available)
+                VALUES (?, ?, ?, 1, 1)
                 """,
                 (member_id, switch_id, gh_login),
             )
@@ -1064,4 +1081,146 @@ class TaskRepository:
                 )
 
             return "REJECTED"
+
+    async def update_member_availability(
+        self, member_id: str, is_available: bool, unavailable_until: Optional[str] = None
+    ) -> bool:
+        """Update member availability flag and optional unavailable_until timestamp."""
+        clean_id = member_id.lower().replace("sw_", "").replace("@", "")
+        async with get_db_writer(self.db_path) as conn:
+            cur = await conn.execute(
+                """
+                UPDATE members
+                SET is_available = ?, unavailable_until = ?
+                WHERE member_id = ? OR LOWER(member_id) = ? OR switch_user_id = ?
+                """,
+                (1 if is_available else 0, unavailable_until, member_id, clean_id, member_id),
+            )
+            return cur.rowcount > 0
+
+    async def get_lowest_load_member(
+        self, room_id: str, exclude_member_ids: Optional[List[str]] = None
+    ) -> Optional[str]:
+        """Find active, available member in room with lowest count of active tasks (OPEN or IN_PROGRESS)."""
+        exclude = [m.lower().replace("sw_", "").replace("@", "") for m in (exclude_member_ids or [])]
+        async with get_db_reader(self.db_path) as db:
+            cur = await db.execute(
+                """
+                SELECT m.member_id, COUNT(t.task_id) AS active_load
+                FROM room_memberships rm
+                JOIN members m ON rm.member_id = m.member_id
+                LEFT JOIN tasks t ON m.member_id = t.owner_member_id AND t.room_id = rm.room_id AND t.status IN ('OPEN', 'IN_PROGRESS')
+                WHERE rm.room_id = ? AND m.active = 1 AND m.is_available = 1
+                GROUP BY m.member_id
+                ORDER BY active_load ASC, m.member_id ASC
+                """,
+                (room_id,),
+            )
+            rows = await cur.fetchall()
+            for r in rows:
+                if r["member_id"].lower() not in exclude:
+                    return r["member_id"]
+            return None
+
+    async def reassign_task(
+        self,
+        room_id: str,
+        task_id: str,
+        new_owner_id: str,
+        actor_id: str,
+        source_event_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Reassign task owner, increment version, and record TASK_REASSIGNED audit event.
+        """
+        clean_new_owner = new_owner_id.lower().replace("sw_", "").replace("@", "")
+        async with get_db_writer(self.db_path) as conn:
+            m_cur = await conn.execute(
+                """
+                SELECT member_id FROM room_memberships
+                WHERE room_id = ? AND (member_id = ? OR LOWER(member_id) = ?) AND active = 1
+                """,
+                (room_id, new_owner_id, clean_new_owner),
+            )
+            m_row = await m_cur.fetchone()
+            if not m_row:
+                raise ValueError(f"Target owner '{new_owner_id}' is not an active member of room '{room_id}'")
+            resolved_new_owner = m_row["member_id"]
+
+            t_cur = await conn.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
+            task = await t_cur.fetchone()
+            if not task:
+                raise ValueError(f"Task '{task_id}' not found")
+
+            old_owner = task["owner_member_id"]
+            new_version = task["version"] + 1
+            now = utc_now_iso()
+
+            await conn.execute(
+                """
+                UPDATE tasks
+                SET owner_member_id = ?, version = ?, updated_at = ?
+                WHERE task_id = ?
+                """,
+                (resolved_new_owner, new_version, now, task_id),
+            )
+
+            import uuid
+
+            event_id = f"evt_{uuid.uuid4().hex[:12]}"
+            await conn.execute(
+                """
+                INSERT INTO task_events (
+                    task_id, task_version, event_id, kind,
+                    actor_member_id, source_room_id, source_event_id,
+                    details_json, created_at
+                ) VALUES (?, ?, ?, 'TASK_REASSIGNED', ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    new_version,
+                    event_id,
+                    actor_id,
+                    room_id,
+                    source_event_id,
+                    json.dumps({"old_owner": old_owner, "new_owner": resolved_new_owner}),
+                    now,
+                ),
+            )
+
+            return {
+                "task_id": task_id,
+                "title": task["title"],
+                "old_owner": old_owner,
+                "new_owner": resolved_new_owner,
+                "version": new_version,
+            }
+
+    async def update_reminded_tier(self, task_id: str, tier: int) -> None:
+        """Update last_reminded_tier for deadline ticker tracking."""
+        async with get_db_writer(self.db_path) as conn:
+            await conn.execute(
+                "UPDATE tasks SET last_reminded_tier = ? WHERE task_id = ?",
+                (tier, task_id),
+            )
+
+    async def get_status_summary(self, room_id: str) -> Dict[str, List[Dict[str, Any]]]:
+        """Generate structured status of tasks in room for God's Eye View."""
+        async with get_db_reader(self.db_path) as db:
+            cur = await db.execute(
+                """
+                SELECT task_id, title, owner_member_id, status, proof_status, blocker, due_at, version
+                FROM tasks
+                WHERE room_id = ?
+                ORDER BY created_at ASC
+                """,
+                (room_id,),
+            )
+            tasks = [dict(r) for r in await cur.fetchall()]
+
+        return {
+            "completed": [t for t in tasks if t["status"] == "COMPLETE"],
+            "blocked": [t for t in tasks if t["status"] == "BLOCKED"],
+            "in_progress": [t for t in tasks if t["status"] in ("IN_PROGRESS", "OPEN")],
+        }
 

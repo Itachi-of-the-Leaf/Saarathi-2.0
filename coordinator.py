@@ -87,6 +87,7 @@ class Coordinator:
         owner_member_id: Optional[str] = None,
         task_id: Optional[str] = None,
         source_event_id: Optional[str] = None,
+        due_at: Optional[str] = None,
     ) -> str:
         """
         Create a new task with initial status OPEN and proof_status NOT_REQUIRED / AWAITING_PROOF.
@@ -110,8 +111,9 @@ class Coordinator:
                 INSERT INTO tasks (
                     task_id, room_id, title, owner_member_id,
                     status, proof_status, policy_id, expected_paths_json,
+                    due_at, last_reminded_tier,
                     version, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'OPEN', 'AWAITING_PROOF', ?, ?, 1, ?, ?)
+                ) VALUES (?, ?, ?, ?, 'OPEN', 'AWAITING_PROOF', ?, ?, ?, 0, 1, ?, ?)
                 """,
                 (
                     tid,
@@ -120,6 +122,7 @@ class Coordinator:
                     assigned_owner,
                     policy_id,
                     json.dumps(expected_paths),
+                    due_at,
                     now,
                     now,
                 ),
@@ -147,6 +150,7 @@ class Coordinator:
                             "owner": assigned_owner,
                             "paths": expected_paths,
                             "policy_id": policy_id,
+                            "due_at": due_at,
                         }
                     ),
                     now,

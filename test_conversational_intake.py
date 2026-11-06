@@ -79,3 +79,4 @@ async def test_claim_done_without_pr_url():
     res = await parse_conversational_intent("@Saarathi done with the feature", "soham")
     assert res["intent"] == "CLAIM_DONE"
     assert res["pr_url"] is None
+

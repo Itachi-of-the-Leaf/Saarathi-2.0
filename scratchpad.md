@@ -49,16 +49,18 @@
     7. Permanent proof snapshot & append-only audit trail logging.
     8. Outbox message queuing.
     9. Conversational intake & Zero-Trust 'No PR' warning.
-  - 13/13 pytest unit tests passed (`test_conversational_intake.py`, `test_proof_gate.py`, `test_coordinator.py`, `test_main_live_loop.py`).
+  - 14/14 pytest unit tests passed (`test_conversational_intake.py`, `test_proof_gate.py`, `test_coordinator.py`, `test_main_live_loop.py`, `test_risk_engine.py`).
   - GitHub Actions CI workflow configured in `.github/workflows/ci.yml`.
 
 ## File Manifest
 - `database.py`: SQLite WAL schema, pragmas, single-writer lock, append-only triggers, team seeding, and `TaskRepository`.
 - `proof_gate.py`: Read-only GitHub API client, POSIX glob matching, check-runs inspection, and 5s TOCTOU guard.
 - `coordinator.py`: Dual state machines, CAS completion guard, recursive CTE cycle detection, authority checks.
+- `risk_engine.py`: Critical path DAG analysis & blocker blast-radius calculator.
 - `main.py`: Conversational LLM intake, fast regex fallback, async SSE listener, outbox dispatcher, and 60s periodic ticker.
 - `demo_cli.py`: Interactive CLI walkthrough.
 - `test_flow.py`: End-to-end smoke test script.
+- `test_risk_engine.py`: Unit tests for Risk Engine critical path & blast radius.
 - `test_conversational_intake.py`: Unit tests for conversational LLM intake.
 - `test_proof_gate.py`: Unit tests for Proof Gate.
 - `test_coordinator.py`: Unit tests for Coordinator & CTE.

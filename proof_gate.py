@@ -342,7 +342,7 @@ class GitHubVerifier:
                 policy_revision=v_input.policy_revision,
                 policy_hash=v_input.policy_hash,
                 changed_paths=sorted(list(set(changed_paths))),
-                selected_checks=[c.model_dump() for c in recheck_selected_checks],
+                selected_checks=[(c.model_dump() if hasattr(c, "model_dump") else c.dict()) for c in recheck_selected_checks],
                 final_read_at=second_read_time,
                 verified_at=datetime.now(timezone.utc).isoformat(),
             )

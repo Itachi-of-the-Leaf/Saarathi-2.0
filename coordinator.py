@@ -157,25 +157,6 @@ class Coordinator:
                 ),
             )
 
-            # Insert outbox confirmation
-            outbox_id = f"out_{uuid.uuid4().hex[:12]}"
-            await conn.execute(
-                """
-                INSERT INTO outbox (
-                    outbox_id, idempotency_key, room_id, body,
-                    status, attempts, next_attempt_at, created_at
-                ) VALUES (?, ?, ?, ?, 'READY', 0, ?, ?)
-                """,
-                (
-                    outbox_id,
-                    f"create_{tid}",
-                    room_id,
-                    f"📋 Task [{tid}] created: '{title}' (Owner: @{assigned_owner}). Scope: {expected_paths}",
-                    now,
-                    now,
-                ),
-            )
-
         logger.info("Task %s created by %s in room %s", tid, actor["member_id"], room_id)
         return tid
 

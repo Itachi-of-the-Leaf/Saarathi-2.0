@@ -977,11 +977,11 @@ class AuditorEngine:
                 await self.coordinator.block_task(room_id, actor_id, task_id, full_reason, source_event_id=event_id)
 
                 # Calculate Blast Radius using RiskEngine
-                blast = await self.risk_engine.calculate_blocker_blast_radius(task_id)
+                blast = await self.risk_engine.calculate_blocker_blast_radius(room_id, task_id)
                 blast_str = ""
-                if blast["total_blocked"] > 0:
+                if blast.get("blast_radius_score", 0) > 0:
                     owners_tag = ", ".join(f"@{o}" for o in blast["affected_owners"])
-                    blast_str = f"\n💥 **Blast Radius**: {blast['total_blocked']} downstream task(s) impacted (Owners: {owners_tag})."
+                    blast_str = f"\n💥 **Blast Radius**: {blast['blast_radius_score']} downstream task(s) impacted (Owners: {owners_tag})."
 
                 if target:
                     await self._queue_room_reply(room_id, f"🛑 Task [{task_id}] blocked by @{target}: {reason}{blast_str}")

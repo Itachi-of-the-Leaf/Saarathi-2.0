@@ -59,6 +59,11 @@ DB_PATH = os.getenv("SQLITE_DB_PATH", DEFAULT_DB_PATH)
 TICKER_INTERVAL = int(os.getenv("TICKER_INTERVAL_SECONDS", "60"))
 OUTBOX_POLL_INTERVAL = float(os.getenv("OUTBOX_POLL_INTERVAL_SECONDS", "2.0"))
 
+# LLM Conversational Intake configuration
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-4o-mini")
+
 
 class SwitchAdapter:
     """Handles parsing and ingestion of Switch platform events."""
@@ -122,6 +127,257 @@ class SwitchAdapter:
             )
             row = await cur.fetchone()
             return row["received_cursor"] if row else None
+
+
+def _regex_intent_fallback(clean_text: str) -> Optional[Dict[str, Any]]:
+    """Fast regex parser for explicit commands starting with keywords."""
+    # Syntax 1: done / verify / proof <pr_url> [task:<task_id>]
+    done_match = re.search(
+        r"^(?:done|verify|proof)\s+(https?://github\.com/[^\s]+)(?:\s+(?:for\s+task|task:)?\s*([a-zA-Z0-9_-]+))?",
+        clean_text,
+        re.IGNORECASE,
+    )
+    if done_match:
+        return {
+            "intent": "CLAIM_DONE",
+            "task_title": None,
+            "owner": None,
+            "expected_scope": None,
+            "pr_url": done_match.group(1),
+            "task_id": done_match.group(2) if done_match.group(2) else None,
+            "blocker_reason": None,
+        }
+
+    # Syntax 2: start <task_id>
+    start_match = re.search(r"^start\s+([a-zA-Z0-9_-]+)", clean_text, re.IGNORECASE)
+    if start_match:
+        return {
+            "intent": "START_TASK",
+            "task_title": None,
+            "owner": None,
+            "expected_scope": None,
+            "pr_url": None,
+            "task_id": start_match.group(1),
+            "blocker_reason": None,
+        }
+
+    # Syntax 3: block <task_id> [reason:<reason>]
+    block_match = re.search(
+        r"^block\s+([a-zA-Z0-9_-]+)(?:\s+(?:reason:)?(.+))?", clean_text, re.IGNORECASE
+    )
+    if block_match:
+        reason_txt = block_match.group(2).strip() if block_match.group(2) else "Blocked waiting on dependencies"
+        return {
+            "intent": "REPORT_BLOCKER",
+            "task_title": None,
+            "owner": None,
+            "expected_scope": None,
+            "pr_url": None,
+            "task_id": block_match.group(1),
+            "blocker_reason": reason_txt,
+        }
+
+    # Syntax 4: unblock <task_id>
+    unblock_match = re.search(r"^unblock\s+([a-zA-Z0-9_-]+)", clean_text, re.IGNORECASE)
+    if unblock_match:
+        return {
+            "intent": "CLEAR_BLOCKER",
+            "task_title": None,
+            "owner": None,
+            "expected_scope": None,
+            "pr_url": None,
+            "task_id": unblock_match.group(1),
+            "blocker_reason": None,
+        }
+
+    # Syntax 5: create <title> [scope:<path1,path2>] [owner:<owner>]
+    create_match = re.search(
+        r"^create\s+(.+?)(?:\s+scope:([^\s]+))?(?:\s+owner:([^\s]+))?$",
+        clean_text,
+        re.IGNORECASE,
+    )
+    if create_match:
+        scopes = create_match.group(2).split(",") if create_match.group(2) else ["src/**", "tests/**"]
+        return {
+            "intent": "CREATE_TASK",
+            "task_title": create_match.group(1).strip(),
+            "owner": create_match.group(3) if create_match.group(3) else None,
+            "expected_scope": scopes,
+            "pr_url": None,
+            "task_id": None,
+            "blocker_reason": None,
+        }
+
+    # Check for completed claim without PR URL:
+    if re.search(r"^(?:done|completed|finished)\b", clean_text, re.IGNORECASE):
+        # Check if PR URL is anywhere in text
+        pr_match = re.search(r"(https?://github\.com/[^\s]+)", clean_text)
+        return {
+            "intent": "CLAIM_DONE",
+            "task_title": None,
+            "owner": None,
+            "expected_scope": None,
+            "pr_url": pr_match.group(1) if pr_match else None,
+            "task_id": None,
+            "blocker_reason": None,
+        }
+
+    return None
+
+
+def _heuristic_intent_fallback(clean_text: str, sender: str) -> Dict[str, Any]:
+    """Fallback heuristic classifier when LLM is unavailable."""
+    # Check for PR URL anywhere
+    pr_match = re.search(r"(https?://github\.com/[^\s/]+/[^\s/]+/pull/\d+)", clean_text)
+    task_match = re.search(r"(?:task|for\s+task|task:)\s*([a-zA-Z0-9_-]+)", clean_text, re.IGNORECASE)
+
+    lower = clean_text.lower()
+    if any(k in lower for k in ("done", "finished", "completed", "pr ready", "submitted pr", "verify")):
+        return {
+            "intent": "CLAIM_DONE",
+            "task_title": None,
+            "owner": None,
+            "expected_scope": None,
+            "pr_url": pr_match.group(1) if pr_match else None,
+            "task_id": task_match.group(1) if task_match else None,
+            "blocker_reason": None,
+        }
+
+    if any(k in lower for k in ("unblock", "resolved blocker", "unblocked", "resumed")):
+        return {
+            "intent": "CLEAR_BLOCKER",
+            "task_title": None,
+            "owner": None,
+            "expected_scope": None,
+            "pr_url": None,
+            "task_id": task_match.group(1) if task_match else None,
+            "blocker_reason": None,
+        }
+
+    if any(k in lower for k in ("block", "blocked", "stuck", "waiting for", "waiting on", "dependency issue")):
+        return {
+            "intent": "REPORT_BLOCKER",
+            "task_title": None,
+            "owner": None,
+            "expected_scope": None,
+            "pr_url": None,
+            "task_id": task_match.group(1) if task_match else None,
+            "blocker_reason": clean_text,
+        }
+
+    if any(k in lower for k in ("start", "working on", "picked up", "begin")):
+        return {
+            "intent": "START_TASK",
+            "task_title": None,
+            "owner": None,
+            "expected_scope": None,
+            "pr_url": None,
+            "task_id": task_match.group(1) if task_match else None,
+            "blocker_reason": None,
+        }
+
+    if any(k in lower for k in ("create", "add task", "new task", "implement", "build")):
+        # Extract title
+        title_cand = re.sub(r"^(?:create|add task|new task|please implement|implement)\s+", "", clean_text, flags=re.IGNORECASE)
+        return {
+            "intent": "CREATE_TASK",
+            "task_title": title_cand.strip(),
+            "owner": sender,
+            "expected_scope": ["src/**", "tests/**"],
+            "pr_url": None,
+            "task_id": None,
+            "blocker_reason": None,
+        }
+
+    return {
+        "intent": "CHAT",
+        "task_title": None,
+        "owner": None,
+        "expected_scope": None,
+        "pr_url": None,
+        "task_id": None,
+        "blocker_reason": None,
+    }
+
+
+async def parse_conversational_intent(
+    text: str, sender: str, http_client: Optional[httpx.AsyncClient] = None
+) -> Dict[str, Any]:
+    """
+    Parse conversational intent from team chat messages addressed to @Saarathi:
+    1. Fast regex fallback if text begins with explicit command keyword.
+    2. Otherwise, calls OpenAI-compatible LLM endpoint with response_format={"type": "json_object"}.
+    3. Falls back gracefully to heuristic classification if LLM is unavailable or fails.
+    """
+    clean_text = re.sub(r"@saarathi\b", "", text, flags=re.IGNORECASE).strip()
+
+    # 1. Fast regex fallback
+    fast_parsed = _regex_intent_fallback(clean_text)
+    if fast_parsed is not None:
+        logger.debug("Fast regex fallback matched: %s", fast_parsed["intent"])
+        return fast_parsed
+
+    # If no LLM API key configured, use heuristic fallback immediately
+    if not LLM_API_KEY:
+        logger.debug("LLM_API_KEY unset; using heuristic intake parser")
+        return _heuristic_intent_fallback(clean_text, sender)
+
+    # 2. Call OpenAI-compatible LLM endpoint
+    system_prompt = (
+        "You are Saarathi 2.0, a Zero-Trust AI Coordinator for team engineering tasks.\n"
+        "Analyze team chat messages addressed to you and extract structured intent into JSON.\n"
+        "Allowed Intents:\n"
+        "- CREATE_TASK: User is asking to create, assign, or track a task.\n"
+        "- CLAIM_DONE: User claims a task or PR is complete, ready for review, or done.\n"
+        "- REPORT_BLOCKER: User reports a blocker, dependency hold, or obstruction.\n"
+        "- CLEAR_BLOCKER: Blocker is resolved, ready to resume, or unblocked.\n"
+        "- START_TASK: User begins or resumes work on a task.\n"
+        "- CHAT: General greetings, inquiries, or non-actionable remarks.\n\n"
+        "Output ONLY a valid JSON object matching this schema:\n"
+        "{\n"
+        '  "intent": "CREATE_TASK" | "CLAIM_DONE" | "REPORT_BLOCKER" | "CLEAR_BLOCKER" | "START_TASK" | "CHAT",\n'
+        '  "task_title": string or null,\n'
+        '  "owner": string or null,\n'
+        '  "expected_scope": ["path/glob/**", ...] or null,\n'
+        '  "pr_url": string or null,\n'
+        '  "task_id": string or null,\n'
+        '  "blocker_reason": string or null\n'
+        "}"
+    )
+
+    url = f"{LLM_BASE_URL}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {LLM_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Sender: {sender}\nMessage: {clean_text}"},
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0.1,
+    }
+
+    client = http_client or httpx.AsyncClient(timeout=10.0)
+    should_close = (http_client is None)
+    try:
+        resp = await client.post(url, json=payload, headers=headers)
+        if resp.status_code == 200:
+            content = resp.json()["choices"][0]["message"]["content"]
+            parsed = json.loads(content)
+            logger.info("LLM conversational intake extracted: %s", parsed)
+            return parsed
+        else:
+            logger.warning("LLM API returned %d: %s. Using heuristic fallback.", resp.status_code, resp.text)
+    except Exception as e:
+        logger.warning("Failed to call LLM API (%s). Using heuristic fallback.", e)
+    finally:
+        if should_close:
+            await client.aclose()
+
+    return _heuristic_intent_fallback(clean_text, sender)
 
 
 class AuditorEngine:
@@ -193,7 +449,7 @@ class AuditorEngine:
                     await asyncio.sleep(5.0)
 
     async def _process_inbox_event(self, event_data: Dict[str, Any]) -> None:
-        """Parse message text and dispatch to coordinator."""
+        """Parse message text and dispatch to coordinator using conversational intake."""
         room_id = event_data.get("room_id") or SWITCH_ROOM_ID
         event_id = event_data.get("id") or event_data.get("event_id")
         actor_id = event_data.get("user_id") or event_data.get("actor_switch_id")
@@ -206,23 +462,43 @@ class AuditorEngine:
         logger.info("Processing addressed event %s from %s: '%s'", event_id, actor_id, text)
 
         try:
-            # Parse command
-            # Syntax 1: @Saarathi done <pr_url> [task:<task_id>]
-            done_match = re.search(r"(?:done|verify|proof)\s+(https?://github\.com/[^\s]+)(?:\s+(?:for\s+task|task:)?\s*([a-zA-Z0-9_-]+))?", text, re.IGNORECASE)
-            # Syntax 2: @Saarathi start <task_id>
-            start_match = re.search(r"start\s+([a-zA-Z0-9_-]+)", text, re.IGNORECASE)
-            # Syntax 3: @Saarathi block <task_id> reason:<reason>
-            block_match = re.search(r"block\s+([a-zA-Z0-9_-]+)(?:\s+reason:(.+))?", text, re.IGNORECASE)
-            # Syntax 4: @Saarathi unblock <task_id>
-            unblock_match = re.search(r"unblock\s+([a-zA-Z0-9_-]+)", text, re.IGNORECASE)
-            # Syntax 5: @Saarathi create <title> scope:<path1,path2>
-            create_match = re.search(r"create\s+(.+?)(?:\s+scope:([^\s]+))?$", text, re.IGNORECASE)
+            # Asynchronous conversational intent parsing
+            intent_data = await parse_conversational_intent(text, actor_id)
+            intent = intent_data.get("intent", "CHAT")
+            logger.info("Parsed intent '%s' for event %s", intent, event_id)
 
-            if done_match:
-                pr_url = done_match.group(1)
-                task_id = done_match.group(2)
+            if intent == "CREATE_TASK":
+                title = intent_data.get("task_title") or text
+                raw_owner = intent_data.get("owner") or actor_id
+                owner_rec = await self.repo.get_member_by_switch_id(raw_owner)
+                owner = owner_rec["member_id"] if owner_rec else raw_owner
+                scopes = intent_data.get("expected_scope") or ["src/**", "tests/**"]
+                tid = await self.coordinator.create_task(
+                    room_id=room_id,
+                    actor_switch_id=actor_id,
+                    title=title,
+                    expected_paths=scopes,
+                    owner_member_id=owner,
+                    source_event_id=event_id,
+                )
+                await self._queue_room_reply(
+                    room_id, f"📋 Task [{tid}] created: '{title}' (Owner: @{owner}) with scope {scopes}"
+                )
+
+            elif intent == "CLAIM_DONE":
+                pr_url = intent_data.get("pr_url")
+                # Strict zero-trust rule: user claims work is complete without PR proof
+                if not pr_url:
+                    await self._queue_room_reply(
+                        room_id,
+                        f"⚠️ @{actor_id}: You claimed work is complete, but provided no GitHub PR proof! "
+                        f"Provide a PR URL or the task remains BLOCKED.",
+                    )
+                    return
+
+                task_id = intent_data.get("task_id")
                 if not task_id:
-                    # Look up active task for this actor
+                    # Look up active in-progress task for this actor
                     member = await self.repo.get_member_by_switch_id(actor_id)
                     if member:
                         async with get_db_reader(self.db_path) as db:
@@ -237,7 +513,7 @@ class AuditorEngine:
                 if not task_id:
                     await self._queue_room_reply(
                         room_id,
-                        f"⚠️ Please specify the task ID for verification: `@Saarathi done {pr_url} task:<task_id>`",
+                        f"⚠️ Please specify which task ID this PR completes: `@Saarathi done {pr_url} task:<task_id>`",
                     )
                     return
 
@@ -250,34 +526,76 @@ class AuditorEngine:
                     inbox_event_key=(room_id, event_id),
                 )
                 logger.info("Verification result for event %s: %s", event_id, res)
+                if res.get("status") == "RETRY_LATER":
+                    await self._queue_room_reply(
+                        room_id,
+                        f"⏳ Proof check pending for task [{task_id}]: {res.get('reason')}. "
+                        f"Task remains in progress; will auto-retry.",
+                    )
 
-            elif start_match:
-                task_id = start_match.group(1)
-                await self.coordinator.start_task(room_id, actor_id, task_id, source_event_id=event_id)
-                await self._queue_room_reply(room_id, f"🚀 Task [{task_id}] moved to IN_PROGRESS.")
+            elif intent == "START_TASK":
+                task_id = intent_data.get("task_id")
+                if not task_id:
+                    member = await self.repo.get_member_by_switch_id(actor_id)
+                    if member:
+                        async with get_db_reader(self.db_path) as db:
+                            cur = await db.execute(
+                                "SELECT task_id FROM tasks WHERE owner_member_id = ? AND status = 'OPEN' ORDER BY updated_at DESC LIMIT 1",
+                                (member["member_id"],),
+                            )
+                            row = await cur.fetchone()
+                            if row:
+                                task_id = row["task_id"]
+                if task_id:
+                    await self.coordinator.start_task(room_id, actor_id, task_id, source_event_id=event_id)
+                    await self._queue_room_reply(room_id, f"🚀 Task [{task_id}] moved to IN_PROGRESS.")
+                else:
+                    await self._queue_room_reply(room_id, "⚠️ Please specify which task to start: `@Saarathi start <task_id>`")
 
-            elif block_match:
-                task_id = block_match.group(1)
-                reason = block_match.group(2) or "Blocked waiting on dependencies/clarification"
-                await self.coordinator.block_task(room_id, actor_id, task_id, reason, source_event_id=event_id)
-                await self._queue_room_reply(room_id, f"🛑 Task [{task_id}] is now BLOCKED: {reason}")
+            elif intent == "REPORT_BLOCKER":
+                task_id = intent_data.get("task_id")
+                reason = intent_data.get("blocker_reason") or "Blocked waiting on dependencies/clarification"
+                if not task_id:
+                    member = await self.repo.get_member_by_switch_id(actor_id)
+                    if member:
+                        async with get_db_reader(self.db_path) as db:
+                            cur = await db.execute(
+                                "SELECT task_id FROM tasks WHERE owner_member_id = ? AND status IN ('OPEN', 'IN_PROGRESS') ORDER BY updated_at DESC LIMIT 1",
+                                (member["member_id"],),
+                            )
+                            row = await cur.fetchone()
+                            if row:
+                                task_id = row["task_id"]
+                if task_id:
+                    await self.coordinator.block_task(room_id, actor_id, task_id, reason, source_event_id=event_id)
+                    await self._queue_room_reply(room_id, f"🛑 Task [{task_id}] is now BLOCKED: {reason}")
+                else:
+                    await self._queue_room_reply(room_id, f"⚠️ Please specify which task is blocked: `@Saarathi block <task_id> {reason}`")
 
-            elif unblock_match:
-                task_id = unblock_match.group(1)
-                await self.coordinator.unblock_task(room_id, actor_id, task_id, source_event_id=event_id)
-                await self._queue_room_reply(room_id, f"✅ Task [{task_id}] is UNBLOCKED and IN_PROGRESS.")
+            elif intent == "CLEAR_BLOCKER":
+                task_id = intent_data.get("task_id")
+                if not task_id:
+                    member = await self.repo.get_member_by_switch_id(actor_id)
+                    if member:
+                        async with get_db_reader(self.db_path) as db:
+                            cur = await db.execute(
+                                "SELECT task_id FROM tasks WHERE owner_member_id = ? AND status = 'BLOCKED' ORDER BY updated_at DESC LIMIT 1",
+                                (member["member_id"],),
+                            )
+                            row = await cur.fetchone()
+                            if row:
+                                task_id = row["task_id"]
+                if task_id:
+                    await self.coordinator.unblock_task(room_id, actor_id, task_id, source_event_id=event_id)
+                    await self._queue_room_reply(room_id, f"✅ Task [{task_id}] is UNBLOCKED and IN_PROGRESS.")
+                else:
+                    await self._queue_room_reply(room_id, "⚠️ Please specify which task to unblock: `@Saarathi unblock <task_id>`")
 
-            elif create_match:
-                title = create_match.group(1).strip()
-                scopes = create_match.group(2).split(",") if create_match.group(2) else ["src/**", "tests/**"]
-                tid = await self.coordinator.create_task(
-                    room_id=room_id,
-                    actor_switch_id=actor_id,
-                    title=title,
-                    expected_paths=scopes,
-                    source_event_id=event_id,
+            elif intent == "CHAT":
+                await self._queue_room_reply(
+                    room_id,
+                    f"👋 Hi @{actor_id}! I am Saarathi, your Zero-Trust Auditor. I track tasks and only mark them complete when PR proof passes all policy and CI checks.",
                 )
-                await self._queue_room_reply(room_id, f"📋 Task [{tid}] created: '{title}' with scope {scopes}")
 
             # Mark inbox event DONE and advance processed_cursor
             async with get_db_writer(self.db_path) as conn:

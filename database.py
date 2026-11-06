@@ -24,6 +24,7 @@ logger = logging.getLogger("saarathi.database")
 DEFAULT_DB_PATH = os.getenv("SQLITE_DB_PATH", "saarathi.db")
 DEFAULT_POLICY_ID = os.getenv("DEFAULT_POLICY_ID", "default_policy")
 DEFAULT_REPO = os.getenv("GITHUB_REPO", "switch-org/switch-core")
+DEFAULT_ROOM_ID = os.getenv("SWITCH_ROOM_ID", "room_switch_demo")
 
 # Single in-process lock to serialize write transactions across coroutines
 WRITE_LOCK = asyncio.Lock()
@@ -424,6 +425,32 @@ async def init_db(
             )
             logger.info("Seeded default policy revision #1 for repo %s", default_repo)
 
+        # Seed Team Roster: soham (lead), samarth, atharva, parth (members)
+        team_roster = [
+            ("soham", "soham", "soham", "lead"),
+            ("samarth", "samarth", "samarth", "member"),
+            ("atharva", "atharva", "atharva", "member"),
+            ("parth", "parth", "parth", "member"),
+        ]
+        target_room = os.getenv("SWITCH_ROOM_ID", DEFAULT_ROOM_ID)
+
+        for member_id, switch_id, gh_login, role in team_roster:
+            await conn.execute(
+                """
+                INSERT OR IGNORE INTO members (member_id, switch_user_id, github_login, active)
+                VALUES (?, ?, ?, 1)
+                """,
+                (member_id, switch_id, gh_login),
+            )
+            await conn.execute(
+                """
+                INSERT OR IGNORE INTO room_memberships (room_id, member_id, role, active)
+                VALUES (?, ?, ?, 1)
+                """,
+                (target_room, member_id, role),
+            )
+        logger.info("Seeded default team roster (soham[lead], samarth, atharva, parth) for room %s", target_room)
+
 
 # ============================================================================
 # TaskRepository: Database operations adhering strictly to LLD 1 & LLD 3
@@ -457,10 +484,15 @@ class TaskRepository:
         self, switch_user_id: str
     ) -> Optional[Dict[str, Any]]:
         """Resolve Switch user ID to member record."""
+        clean_id = switch_user_id.lower().replace("sw_", "")
         async with get_db_reader(self.db_path) as db:
             cursor = await db.execute(
-                "SELECT * FROM members WHERE switch_user_id = ? AND active = 1",
-                (switch_user_id,),
+                """
+                SELECT * FROM members
+                WHERE (switch_user_id = ? OR member_id = ? OR LOWER(member_id) = ? OR LOWER(switch_user_id) = ?)
+                  AND active = 1
+                """,
+                (switch_user_id, switch_user_id, clean_id, clean_id),
             )
             row = await cursor.fetchone()
             return dict(row) if row else None
@@ -469,10 +501,14 @@ class TaskRepository:
         self, room_id: str, member_id: str
     ) -> Optional[Dict[str, Any]]:
         """Get member role in room."""
+        clean_id = member_id.lower().replace("sw_", "")
         async with get_db_reader(self.db_path) as db:
             cursor = await db.execute(
-                "SELECT * FROM room_memberships WHERE room_id = ? AND member_id = ? AND active = 1",
-                (room_id, member_id),
+                """
+                SELECT * FROM room_memberships
+                WHERE room_id = ? AND (member_id = ? OR LOWER(member_id) = ?) AND active = 1
+                """,
+                (room_id, member_id, clean_id),
             )
             row = await cursor.fetchone()
             return dict(row) if row else None

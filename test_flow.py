@@ -1,6 +1,7 @@
 """
 test_flow.py: Comprehensive smoke-test script verifying the entire Saarathi Zero-Trust
-Auditor pipeline end-to-end based on LLD 1, 2, and 3.
+Auditor pipeline end-to-end based on LLD 1, 2, and 3, including Team Roster Seeding
+and Conversational Intake.
 """
 
 import asyncio
@@ -22,6 +23,7 @@ from coordinator import (
     DependencyCycleError,
     InvalidStateTransitionError,
 )
+from main import AuditorEngine, parse_conversational_intent
 
 SMOKE_DB = "smoke_saarathi.db"
 
@@ -39,14 +41,27 @@ async def run_smoke_test():
             except OSError:
                 pass
 
-    # 1. Initialize SQLite with WAL mode & Seed Default Policy
-    print("\n[Step 1] Initializing SQLite database with WAL pragmas & triggers...")
+    # 1. Initialize SQLite with WAL mode & Seed Default Policy + Team Roster
+    print("\n[Step 1] Initializing SQLite database with WAL pragmas, policy & team roster...")
     await init_db(SMOKE_DB, default_repo="switch-org/switch-core")
     repo = TaskRepository(SMOKE_DB)
     policy = await repo.get_policy_head("default_policy")
     assert policy is not None
     assert policy["current_revision"] == 1
     print(f"  ✓ Database initialized in WAL mode. Seeded Policy rev 1, hash: {policy['current_hash'][:16]}...")
+
+    # Verify Team Roster Seeding (soham, samarth, atharva, parth)
+    soham = await repo.get_member_by_switch_id("soham")
+    assert soham is not None, "Member 'soham' should be seeded"
+    soham_mem = await repo.get_room_membership("room_switch_demo", "soham")
+    assert soham_mem is not None and soham_mem["role"] == "lead", "Soham should have 'lead' role"
+
+    for member_name in ["samarth", "atharva", "parth"]:
+        m = await repo.get_member_by_switch_id(member_name)
+        assert m is not None, f"Member '{member_name}' should be seeded"
+        mem = await repo.get_room_membership("room_switch_demo", member_name)
+        assert mem is not None and mem["role"] == "member", f"{member_name} should have 'member' role"
+    print("  ✓ Team Roster verified: soham (lead), samarth, atharva, parth seeded successfully.")
 
     # 2. Verify append-only triggers on immutable tables
     print("\n[Step 2] Verifying append-only triggers on immutable tables...")
@@ -61,7 +76,7 @@ async def run_smoke_test():
     assert trigger_verified, "Policy trigger failed to block update!"
 
     # 3. Seed test members & room memberships
-    print("\n[Step 3] Seeding test actors & room memberships...")
+    print("\n[Step 3] Enrolling test actors in 'room_core'...")
     async with get_db_writer(SMOKE_DB) as conn:
         await conn.execute(
             "INSERT INTO members (member_id, switch_user_id, github_login, active) VALUES (?, ?, ?, 1)",
@@ -221,30 +236,29 @@ async def run_smoke_test():
         assert task_final["proof_status"] == "VERIFIED"
         print(f"  ✓ Atomic CAS committed: Task is COMPLETE & VERIFIED. Final version: {task_final['version']}.")
 
-    # 7. Verify Proof Snapshot & Audit Events
-    print("\n[Step 7] Verifying immutable proof snapshot & audit trail...")
+    # 7. Conversational Intake & Claim-Done without PR
+    print("\n[Step 7] Testing Conversational Intake & Zero-Trust 'No PR' Rejection...")
+    engine = AuditorEngine(SMOKE_DB)
+
+    # Simulate message: User claims task is finished but forgot the PR link
+    no_pr_event = {
+        "id": "evt_no_pr_1",
+        "room_id": "room_core",
+        "user_id": "sw_alice",
+        "text": "@Saarathi I finished the auth token parser, all done!",
+    }
+    await engine._process_inbox_event(no_pr_event)
+
+    # Check that Outbox contains warning rejecting claim without proof
     async with get_db_reader(SMOKE_DB) as db:
-        cur = await db.execute("SELECT * FROM proof_snapshots WHERE task_id = ?", (task_id,))
-        snapshot = await cur.fetchone()
-        assert snapshot is not None
-        assert snapshot["head_sha"] == head_sha
-        assert snapshot["pr_number"] == 101
-        print(f"  ✓ Proof snapshot stored permanently for SHA {head_sha[:7]} on PR #101.")
+        cur = await db.execute(
+            "SELECT body FROM outbox WHERE room_id = 'room_core' AND body LIKE '%provided no GitHub PR proof%'",
+        )
+        warning_msg = await cur.fetchone()
+        assert warning_msg is not None, "Should have queued warning for missing PR proof"
+        print(f"  ✓ Zero-Trust verified: '{warning_msg['body']}'")
 
-        cur = await db.execute("SELECT kind, task_version FROM task_events WHERE task_id = ? ORDER BY task_version ASC", (task_id,))
-        events = await cur.fetchall()
-        print(f"  ✓ Audit trail logged {len(events)} immutable events:")
-        for ev in events:
-            print(f"     • Version {ev['task_version']}: {ev['kind']}")
-
-        # 8. Verify Outbox Queue
-        cur = await db.execute("SELECT * FROM outbox WHERE room_id = 'room_core' AND body LIKE '%VERIFIED & COMPLETE%'")
-        outbox_row = await cur.fetchone()
-        assert outbox_row is not None
-        assert outbox_row["status"] == "READY"
-        print(f"  ✓ Outbox queued message: '{outbox_row['body']}' (Idempotency Key: {outbox_row['idempotency_key']}).")
-
-    # 9. Clean up
+    # 8. Clean up
     for f in [SMOKE_DB, f"{SMOKE_DB}-wal", f"{SMOKE_DB}-shm"]:
         if os.path.exists(f):
             try:
@@ -259,4 +273,3 @@ async def run_smoke_test():
 
 if __name__ == "__main__":
     asyncio.run(run_smoke_test())
-

@@ -115,3 +115,4 @@ async def test_inbox_ingest_and_outbox_dispatch():
         assert sent_row["status"] == "SENT"
         assert sent_row["remote_message_id"] == "remote_msg_999"
         assert sent_row["sent_at"] is not None
+

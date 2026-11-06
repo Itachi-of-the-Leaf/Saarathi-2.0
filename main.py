@@ -119,7 +119,7 @@ class SwitchAdapter:
         self.db_path = db_path
         self.repo = TaskRepository(db_path)
 
-    async def ingest_event(self, event_data: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    async def ingest_event(self, event_data: Dict[str, Any]) -> tuple[bool, Optional[str]]:
         """
         Deduplicate and store Switch event in switch_inbox.
         Advances room_cursors.received_cursor.

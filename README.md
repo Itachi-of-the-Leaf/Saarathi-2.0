@@ -91,6 +91,7 @@ pytest -v
 ├── proof_gate.py                                # Read-only GitHub API client & TOCTOU guard
 ├── coordinator.py                              # State machines, CAS guard & cycle detection
 ├── main.py                                      # Async SSE listener, outbox dispatcher, ticker
+├── saarathi_tools.py                            # Standard tool-calling bridge for LLM agents & CLI
 ├── test_flow.py                                 # End-to-end smoke test
 ├── test_proof_gate.py                           # Unit tests for Proof Gate
 ├── test_coordinator.py                          # Unit tests for Coordinator & CTE
@@ -100,4 +101,29 @@ pytest -v
 ├── scratchpad.md                                # Build progress tracking
 └── README.md                                    # Documentation
 ```
+
+---
+
+## 🤖 Agent Tool-Calling
+
+When an LLM agent needs to interact with Saarathi's engine, it can invoke the tool directly via terminal:
+
+* **Schedule a task with autonomous deadline**:
+  ```powershell
+  python saarathi_tools.py create room_switch_demo soham "Emergency Bugfix" 2
+  ```
+
+* **Verify a PR proof deterministically**:
+  ```powershell
+  python saarathi_tools.py verify room_switch_demo soham task_123 https://github.com/org/repo/pull/42
+  ```
+
+* **Query God's Eye project status**:
+  ```powershell
+  python saarathi_tools.py status room_switch_demo
+  ```
+
+### The Background Ticker (`main.py`):
+Remains running in the background to automatically fire the unprompted Slack alerts at $T-1\text{h}$, $T=0$, and $T+1\text{h}$.
+
 

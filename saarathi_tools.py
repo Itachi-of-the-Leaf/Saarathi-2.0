@@ -89,6 +89,19 @@ class SaarathiToolBridge:
         await init_db(self.db_path)
         return await self.risk_engine.calculate_blocker_blast_radius(room_id, task_id)
 
+    def generate_dashboard(self, room_id: Optional[str] = None) -> Dict[str, Any]:
+        """Tool: Generates interactive God's Eye View DAG dashboard HTML."""
+        from dashboard import generate_dashboard_html
+        target_room = room_id or os.getenv("SWITCH_ROOM_ID", "0dea8081-87f2-48dd-9863-2901e0934a00")
+        path = generate_dashboard_html(target_room)
+        return {
+            "status": "SUCCESS",
+            "room_id": target_room,
+            "dashboard_file": str(path),
+            "file_url": f"file:///{path}",
+            "message": f"Interactive God's Eye View DAG generated at {path}",
+        }
+
 
 if __name__ == "__main__":
     import sys
@@ -121,6 +134,12 @@ if __name__ == "__main__":
     elif cmd == "blast-radius":
         # python saarathi_tools.py blast-radius <room_id> <task_id>
         res = asyncio.run(bridge.check_blocker_blast_radius(sys.argv[2], sys.argv[3]))
+        print(json.dumps(res, indent=2))
+
+    elif cmd == "dashboard":
+        # python saarathi_tools.py dashboard [room_id]
+        room_id = sys.argv[2] if len(sys.argv) > 2 else os.getenv("SWITCH_ROOM_ID", "0dea8081-87f2-48dd-9863-2901e0934a00")
+        res = bridge.generate_dashboard(room_id)
         print(json.dumps(res, indent=2))
 
     else:

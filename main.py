@@ -52,8 +52,12 @@ logging.basicConfig(
 logger = logging.getLogger("saarathi.main")
 
 # Environment configuration
-SWITCH_BASE_URL = os.getenv("SWITCH_BASE_URL", "https://api.switch.example.com").rstrip("/")
-SWITCH_TOKEN = os.getenv("SWITCH_TOKEN", "")
+from auto_switch import auto_discover_switch_config
+
+_auto_cfg = auto_discover_switch_config()
+SWITCH_BASE_URL = os.getenv("SWITCH_BASE_URL") or _auto_cfg.get("SWITCH_BASE_URL") or "http://localhost:8000"
+SWITCH_BASE_URL = SWITCH_BASE_URL.rstrip("/")
+SWITCH_TOKEN = os.getenv("SWITCH_TOKEN") or _auto_cfg.get("SWITCH_TOKEN") or ""
 SWITCH_ROOM_ID = os.getenv("SWITCH_ROOM_ID", "room_switch_demo")
 AGENT_ID = os.getenv("AGENT_ID", "saarathi-auditor")
 DB_PATH = os.getenv("SQLITE_DB_PATH", DEFAULT_DB_PATH)
@@ -638,6 +642,11 @@ class AuditorEngine:
         Listens for room events, deduplicates in switch_inbox, and processes commands.
         """
         logger.info("Starting Inbound Switch SSE Listener for room: %s", SWITCH_ROOM_ID)
+        if os.getenv("DISABLE_SSE", "false").lower() in ("true", "1"):
+            logger.info("Inbound SSE listener disabled via DISABLE_SSE=true. Autonomous Background Ticker and Outbox Hound active.")
+            await shutdown_event.wait()
+            return
+
         headers = {
             "Accept": "text/event-stream",
             "User-Agent": f"Saarathi-Auditor/{AGENT_ID}",
@@ -656,7 +665,52 @@ class AuditorEngine:
 
             try:
                 async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
-                    async with aconnect_sse(client, "GET", url, headers=headers, params=params) as event_source:
+                    async with client.stream("GET", url, headers=headers, params=params) as resp:
+                        if resp.status_code == 409:
+                            body = await resp.aread()
+                            try:
+                                data = json.loads(body)
+                                err_code = data.get("error", {}).get("code")
+                            except Exception:
+                                err_code = ""
+
+                            if err_code == "managed_by_controller":
+                                logger.info(
+                                    "Switch Console Agent Controller is active for @Saarathi (chat handled via Switch Console & saarathi_tools.py). "
+                                    "SSE listener standing down while Autonomous Background Ticker and Outbox Hound monitor deadlines in background."
+                                )
+                                try:
+                                    await asyncio.wait_for(shutdown_event.wait(), timeout=60.0)
+                                except asyncio.TimeoutError:
+                                    pass
+                                continue
+
+                        if resp.status_code == 401:
+                            body = await resp.aread()
+                            logger.warning(
+                                "Switch SSE authentication rejected (401 Unauthorized: %s). Check SWITCH_TOKEN. Pausing 30s...",
+                                body.decode(errors="ignore")[:200],
+                            )
+                            try:
+                                await asyncio.wait_for(shutdown_event.wait(), timeout=30.0)
+                            except asyncio.TimeoutError:
+                                pass
+                            continue
+
+                        if resp.status_code != 200:
+                            body = await resp.aread()
+                            logger.warning(
+                                "Switch SSE returned status %d: %s. Retrying in %.1fs...",
+                                resp.status_code,
+                                body.decode(errors="ignore")[:200],
+                                backoff_seconds,
+                            )
+                            await asyncio.sleep(backoff_seconds)
+                            backoff_seconds = min(backoff_seconds * 2, 30.0)
+                            continue
+
+                        from httpx_sse import EventSource
+                        event_source = EventSource(resp)
                         logger.info("Connected to Switch SSE stream at %s", url)
                         backoff_seconds = 1.0
 

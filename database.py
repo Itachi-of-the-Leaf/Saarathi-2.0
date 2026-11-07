@@ -449,7 +449,10 @@ async def init_db(
             ("atharva", "atharva", "atharva", "member"),
             ("parth", "parth", "parth", "member"),
         ]
-        target_room = os.getenv("SWITCH_ROOM_ID", DEFAULT_ROOM_ID)
+        target_rooms = {"room_switch_demo", DEFAULT_ROOM_ID}
+        env_room = os.getenv("SWITCH_ROOM_ID")
+        if env_room:
+            target_rooms.add(env_room)
 
         for member_id, switch_id, gh_login, role in team_roster:
             await conn.execute(
@@ -459,14 +462,15 @@ async def init_db(
                 """,
                 (member_id, switch_id, gh_login),
             )
-            await conn.execute(
-                """
-                INSERT OR IGNORE INTO room_memberships (room_id, member_id, role, active)
-                VALUES (?, ?, ?, 1)
-                """,
-                (target_room, member_id, role),
-            )
-        logger.info("Seeded default team roster (soham[lead], samarth, atharva, parth) for room %s", target_room)
+            for r_id in target_rooms:
+                await conn.execute(
+                    """
+                    INSERT OR IGNORE INTO room_memberships (room_id, member_id, role, active)
+                    VALUES (?, ?, ?, 1)
+                    """,
+                    (r_id, member_id, role),
+                )
+        logger.info("Seeded default team roster (soham[lead], samarth, atharva, parth) for rooms %s", list(target_rooms))
 
 
 # ============================================================================

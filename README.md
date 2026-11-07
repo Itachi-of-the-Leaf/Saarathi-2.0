@@ -5,6 +5,32 @@
 
 ---
 
+## ⚖️ For Judges: 10-Second Reproducibility (Zero Setup Required)
+
+If you are evaluating this repository without a local Switch Console or Slack bridge installed, you can verify the entire zero-trust auditing pipeline, SQLite WAL state machine, recursive CTE deadlock detection, and Proof Gate in **10 seconds with zero configuration and zero API keys**:
+
+```bash
+# 1. Clone & install
+git clone https://github.com/Itachi-of-the-Leaf/Saarathi-2.0.git
+cd Saarathi-2.0
+pip install -r requirements.txt
+
+# 2. Run the offline end-to-end smoke test
+python test_flow.py
+
+# 3. Run the interactive terminal demo
+python demo_cli.py
+
+# 4. Run the full unit test suite (20/20 tests passing)
+pytest -v
+```
+
+### If Running with Live Switch Console:
+
+Saarathi includes auto-discovery via `auto_switch.py`. When Switch Console is running, `python main.py` automatically detects your local port. Copy your room URL from Switch Console into `SWITCH_ROOM_ID` in `.env` and run `python main.py`.
+
+---
+
 ## 🏛️ Architecture & Design
 
 Saarathi 2.0 implements the specifications from the architecture designs:

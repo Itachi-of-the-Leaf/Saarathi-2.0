@@ -24,7 +24,7 @@ async def setup_db():
             except OSError:
                 pass
 
-    await init_db(TEST_DB)
+    await init_db(TEST_DB, default_repo="switch-org/switch-core")
 
     # Seed members & memberships
     async with get_db_writer(TEST_DB) as conn:

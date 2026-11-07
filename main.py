@@ -1343,14 +1343,21 @@ class AuditorEngine:
         out_id = row["outbox_id"]
         token = row["claim_token"]
         attempts = row["attempts"]
-        post_url = f"{SWITCH_BASE_URL}/rooms/{room_id}/messages"
+        post_url = f"{SWITCH_BASE_URL}/gateway/rooms/{room_id}/messages"
         payload = {
             "body": sanitize_public_output(row["body"]),
+            "text": sanitize_public_output(row["body"]),
+            "content": sanitize_public_output(row["body"]),
             "idempotency_key": row["idempotency_key"],
         }
 
         try:
             resp = await client.post(post_url, json=payload, headers=headers)
+            if resp.status_code == 404:
+                post_url_fallback = f"{SWITCH_BASE_URL}/rooms/{room_id}/messages"
+                resp = await client.post(
+                    post_url_fallback, json=payload, headers=headers
+                )
             if resp.status_code in (200, 201):
                 # Success
                 remote_id = resp.json().get("id") if resp.headers.get("content-type") == "application/json" else None

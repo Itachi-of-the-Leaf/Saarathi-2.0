@@ -60,8 +60,34 @@ def auto_discover_switch_config() -> Dict[str, str]:
 
     return config
 
+def sync_to_env_file(config: Dict[str, str], env_path: str = ".env") -> None:
+    """Writes discovered Switch settings directly into .env so the user doesn't have to."""
+    existing = {}
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    existing[k.strip()] = v.strip()
+
+    updated = False
+    for k, v in config.items():
+        # Only populate if currently empty or missing
+        if not existing.get(k):
+            existing[k] = v
+            updated = True
+
+    if updated:
+        with open(env_path, "w", encoding="utf-8") as f:
+            for k, v in existing.items():
+                f.write(f"{k}={v}\n")
+        print(f"✓ Automatically populated {env_path} with discovered Switch values!")
+
 if __name__ == "__main__":
-    discovered = auto_discover_switch_config()
+    cfg = auto_discover_switch_config()
     print("Auto-discovered Switch settings:")
-    for k, v in discovered.items():
+    for k, v in cfg.items():
         print(f"  {k}={v}")
+    sync_to_env_file(cfg)
+

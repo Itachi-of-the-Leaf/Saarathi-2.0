@@ -4,7 +4,7 @@ test_conversational_intake.py: Unit tests for conversational LLM intake and fast
 
 import pytest
 import httpx
-from main import parse_conversational_intent, _regex_intent_fallback, _heuristic_intent_fallback
+from saarathi.services.auditor import parse_conversational_intent, _regex_intent_fallback, _heuristic_intent_fallback
 
 @pytest.mark.asyncio
 async def test_fast_regex_fallback():
@@ -57,7 +57,7 @@ async def test_conversational_intake_mocked_llm():
     transport = httpx.MockTransport(mock_transport)
     async with httpx.AsyncClient(transport=transport) as client:
         # Patch LLM_API_KEY for test
-        import main
+        import saarathi.services.auditor as main
         orig_key = main.LLM_API_KEY
         main.LLM_API_KEY = "mock_key"
         try:
@@ -82,7 +82,7 @@ async def test_claim_done_without_pr_url():
 
 
 def test_secret_sanitizer():
-    from main import sanitize_public_output
+    from saarathi.services.auditor import sanitize_public_output
 
     sample = (
         "Logs: ghp_1234567890abcdef1234567890abcdef1234, "
@@ -100,8 +100,8 @@ def test_secret_sanitizer():
 
 @pytest.mark.asyncio
 async def test_conversational_chaining_and_deadlock_mediation(tmp_path):
-    from database import init_db, get_db_reader
-    from main import AuditorEngine
+    from saarathi.database import init_db, get_db_reader
+    from saarathi.services.auditor import AuditorEngine
 
     test_db = str(tmp_path / "chaining_test.db")
     await init_db(test_db)
@@ -115,7 +115,7 @@ async def test_conversational_chaining_and_deadlock_mediation(tmp_path):
         "text": "@Saarathi create Task A and Task B",
     }
     # Mock parse_conversational_intent returning a cycle
-    import main
+    import saarathi.services.auditor as main
     orig_parse = main.parse_conversational_intent
 
     async def mock_cycle_parse(t, s, **kw):
@@ -147,8 +147,8 @@ async def test_conversational_chaining_and_deadlock_mediation(tmp_path):
 
 @pytest.mark.asyncio
 async def test_availability_and_reallocation(tmp_path):
-    from database import init_db, get_db_reader
-    from main import AuditorEngine
+    from saarathi.database import init_db, get_db_reader
+    from saarathi.services.auditor import AuditorEngine
 
     test_db = str(tmp_path / "avail_test.db")
     await init_db(test_db)
@@ -185,8 +185,8 @@ async def test_availability_and_reallocation(tmp_path):
 
 @pytest.mark.asyncio
 async def test_lead_only_reassignment(tmp_path):
-    from database import init_db, get_db_reader
-    from main import AuditorEngine
+    from saarathi.database import init_db, get_db_reader
+    from saarathi.services.auditor import AuditorEngine
 
     test_db = str(tmp_path / "reassign_test.db")
     await init_db(test_db)
@@ -227,8 +227,8 @@ async def test_lead_only_reassignment(tmp_path):
 
 @pytest.mark.asyncio
 async def test_status_query_gods_eye(tmp_path):
-    from database import init_db, get_db_reader
-    from main import AuditorEngine
+    from saarathi.database import init_db, get_db_reader
+    from saarathi.services.auditor import AuditorEngine
 
     test_db = str(tmp_path / "status_test.db")
     await init_db(test_db)
@@ -254,8 +254,8 @@ async def test_status_query_gods_eye(tmp_path):
 @pytest.mark.asyncio
 async def test_deadline_hound_tiers(tmp_path):
     from datetime import datetime, timedelta, timezone
-    from database import init_db, get_db_reader, get_db_writer
-    from main import AuditorEngine
+    from saarathi.database import init_db, get_db_reader, get_db_writer
+    from saarathi.services.auditor import AuditorEngine
 
     test_db = str(tmp_path / "deadline_test.db")
     await init_db(test_db)

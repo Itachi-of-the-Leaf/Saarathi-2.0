@@ -1,5 +1,5 @@
 """
-test_main_live_loop.py: Integration test verifying main.py's three concurrent loops:
+test_main_live_loop.py: Integration test verifying the auditor service's three concurrent loops:
 1. Ingesting event via SwitchAdapter
 2. Coordinator executing command
 3. Outbox background dispatcher delivering reply
@@ -7,11 +7,13 @@ test_main_live_loop.py: Integration test verifying main.py's three concurrent lo
 """
 
 import asyncio
+import json
 import os
 import pytest
 import httpx
-from database import init_db, get_db_writer, get_db_reader, TaskRepository
-from main import SwitchAdapter, AuditorEngine, AGENT_ID
+from saarathi.database import init_db, get_db_writer, get_db_reader, TaskRepository
+from saarathi.integrations.slack import SlackAdapter
+from saarathi.services.auditor import SwitchAdapter, AuditorEngine, AGENT_ID
 
 TEST_MAIN_DB = "test_main_loop.db"
 
@@ -115,4 +117,59 @@ async def test_inbox_ingest_and_outbox_dispatch():
         assert sent_row["status"] == "SENT"
         assert sent_row["remote_message_id"] == "remote_msg_999"
         assert sent_row["sent_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_structured_switch_reply_routes_to_slack_thread_and_is_idempotent():
+    engine = AuditorEngine(TEST_MAIN_DB)
+    engine.slack_adapter = SlackAdapter(token="xoxb-test-token")
+
+    event = {
+        "id": "evt_slack_001",
+        "type": "saarathi.command",
+        "room_id": "room_demo",
+        "user_id": "sw_carol",
+        "slack": {"channel_id": "C0123456789", "thread_ts": "1730977200.123456"},
+        "command": {"action": "list_tasks", "request_id": "slack-req-001"},
+    }
+    await engine._process_inbox_event(event)
+    await engine._process_inbox_event(event)
+
+    async with get_db_reader(TEST_MAIN_DB) as db:
+        cur = await db.execute(
+            "SELECT * FROM outbox WHERE idempotency_key = 'command_result_slack-req-001'"
+        )
+        rows = await cur.fetchall()
+    assert len(rows) == 1
+    assert rows[0]["destination"] == "slack"
+    assert json.loads(rows[0]["destination_json"]) == {
+        "channel_id": "C0123456789",
+        "thread_ts": "1730977200.123456",
+    }
+
+    delivered = []
+
+    def mock_slack_post(request: httpx.Request) -> httpx.Response:
+        delivered.append(request)
+        assert request.headers["Authorization"] == "Bearer xoxb-test-token"
+        body = json.loads(request.content)
+        assert body["channel"] == "C0123456789"
+        assert body["thread_ts"] == "1730977200.123456"
+        assert body["client_msg_id"] == "command_result_slack-req-001"
+        return httpx.Response(200, json={"ok": True, "ts": "1730977201.123456"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(mock_slack_post)) as client:
+        claimed = await engine._claim_due_outbox_rows()
+        slack_rows = [row for row in claimed if row["destination"] == "slack"]
+        assert len(slack_rows) == 1
+        await engine._dispatch_outbox_message(client, slack_rows[0], headers={})
+
+    assert len(delivered) == 1
+    async with get_db_reader(TEST_MAIN_DB) as db:
+        cur = await db.execute(
+            "SELECT status, remote_message_id FROM outbox WHERE idempotency_key = 'command_result_slack-req-001'"
+        )
+        sent = await cur.fetchone()
+    assert sent["status"] == "SENT"
+    assert sent["remote_message_id"] == "1730977201.123456"
 

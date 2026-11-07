@@ -1,7 +1,7 @@
 import pytest
 import asyncio
 import httpx
-from proof_gate import (
+from saarathi.integrations.github import (
     GitHubVerifier,
     VerificationInput,
     VerifiedSnapshot,
@@ -100,6 +100,38 @@ async def test_verifier_mocked_success():
         assert result.head_sha == head_sha
         assert result.author_login == "alice"
         assert len(result.selected_checks) == 2
+
+
+@pytest.mark.asyncio
+async def test_verifier_timeout_is_structured_retryable_failure():
+    async def timeout_handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("GitHub timed out", request=request)
+
+    verifier = GitHubVerifier(
+        client=httpx.AsyncClient(transport=httpx.MockTransport(timeout_handler))
+    )
+    try:
+        result = await verifier.verify(
+            "att-timeout",
+            1,
+            VerificationInput(
+                task_id="task-timeout",
+                pr_url="https://github.com/switch-org/switch-core/pull/42",
+                expected_paths=["src/**"],
+                allowed_authors=["samarth"],
+                policy_id="default_policy",
+                policy_revision=1,
+                policy_hash="hash",
+                repo_full_name="switch-org/switch-core",
+                required_checks=[{"name": "test"}],
+            ),
+        )
+    finally:
+        await verifier._external_client.aclose()
+
+    assert isinstance(result, RetryableFailure)
+    assert result.error_type == "GitHubTransient"
+    assert "timed out" in result.reason
 
 @pytest.mark.asyncio
 async def test_verifier_scope_violation():

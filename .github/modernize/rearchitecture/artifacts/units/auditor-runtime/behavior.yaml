@@ -1,0 +1,26 @@
+unit: auditor-runtime
+side_effects:
+  - source_loc: saarathi/services/auditor.py:1220
+    effect: "claims and dispatches due outbox messages with retry scheduling"
+    must_preserve: true
+  - source_loc: saarathi/services/auditor.py:692
+    effect: "processes persisted inbound events and emits task workflow messages"
+    must_preserve: true
+branches:
+  - source_loc: saarathi/services/auditor.py:635
+    condition: "SSE stream disconnects or raises a transport error"
+    behavior: "recover from the persisted cursor and continue listening"
+    must_preserve: true
+error_paths:
+  - source_loc: saarathi/services/auditor.py:1284
+    trigger: "outbound Switch request fails"
+    outcome: "reschedule with bounded retry/backoff"
+    contract: "message remains durable in outbox"
+    must_preserve: true
+concurrency:
+  model: coroutine
+  tx_boundary:
+    source_loc: saarathi/database.py:81
+    scope: "writer context wraps each atomic database operation"
+    isolation: "SQLite BEGIN IMMEDIATE"
+    must_preserve: true

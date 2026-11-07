@@ -1,5 +1,5 @@
 """
-risk_engine.py: Critical path analysis and blocker blast-radius evaluation for Saarathi 2.0.
+saarathi.core.risk_engine: Critical path analysis and blocker blast-radius evaluation for Saarathi 2.0.
 Implements the Scheduler + Risk Engine component specified in HDL_1_of_1.
 """
 
@@ -9,7 +9,7 @@ import logging
 from collections import defaultdict, deque
 from typing import Any, Dict, List, Set, Tuple
 
-from database import DEFAULT_DB_PATH, get_db_reader
+from ..database import DEFAULT_DB_PATH, get_db_reader
 
 logger = logging.getLogger("saarathi.risk_engine")
 

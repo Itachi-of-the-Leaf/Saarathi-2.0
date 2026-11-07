@@ -9,9 +9,9 @@ import os
 import sys
 import httpx
 
-from database import init_db, get_db_writer, get_db_reader, TaskRepository
-from proof_gate import GitHubVerifier
-from coordinator import Coordinator, DependencyCycleError, AuthorizationError
+from saarathi.database import init_db, get_db_writer, get_db_reader, TaskRepository
+from saarathi.integrations.github import GitHubVerifier
+from saarathi.core.coordinator import Coordinator, DependencyCycleError, AuthorizationError
 
 DEMO_DB = "demo_saarathi.db"
 

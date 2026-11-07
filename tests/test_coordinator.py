@@ -4,9 +4,9 @@ import pytest
 import pytest_asyncio
 import httpx
 
-from database import init_db, get_db_writer, get_db_reader, TaskRepository
-from proof_gate import GitHubVerifier
-from coordinator import (
+from saarathi.database import init_db, get_db_writer, get_db_reader, TaskRepository
+from saarathi.integrations.github import GitHubVerifier
+from saarathi.core.coordinator import (
     Coordinator,
     AuthorizationError,
     DependencyCycleError,

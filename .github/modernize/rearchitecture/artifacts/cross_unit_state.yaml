@@ -1,0 +1,13 @@
+flows:
+  - name: switch-inbox-to-command-processing
+    writer: {unit: auditor-runtime, state: switch_inbox}
+    reader: {unit: auditor-runtime, state: switch_inbox}
+    pairing: matched
+    must_preserve: true
+    verification_hint: "Deduplicate by room/event id and persist processing state."
+  - name: proof-to-outbox
+    writer: {unit: auditor-runtime, state: task_events_and_outbox}
+    reader: {unit: auditor-runtime, state: outbox_dispatcher}
+    pairing: matched
+    must_preserve: true
+    verification_hint: "Proof completion and notification enqueue share one writer transaction."

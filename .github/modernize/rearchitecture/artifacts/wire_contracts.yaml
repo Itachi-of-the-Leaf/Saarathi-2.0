@@ -1,0 +1,34 @@
+contracts:
+  - name: switch-event-stream
+    unit: auditor-runtime
+    type: rest
+    stability: must_preserve
+    source_loc: saarathi/services/auditor.py:635
+    contract:
+      method: GET
+      path: /rooms/{room_id}/events
+      request: "room id plus received cursor"
+      response: "SSE event payloads"
+    semantic_divergence: "Cursor advancement and inbox deduplication must remain coupled."
+  - name: switch-outbox-message
+    unit: auditor-runtime
+    type: rest
+    stability: must_preserve
+    source_loc: saarathi/services/auditor.py:1211
+    contract:
+      method: POST
+      path: /rooms/{room_id}/messages
+      request: "sanitized text message"
+      response: "provider acknowledgement"
+    semantic_divergence: "Retry uses leased outbox rows and public-output sanitization."
+  - name: github-proof-api
+    unit: github-proof
+    type: sdk
+    stability: must_preserve
+    source_loc: saarathi/integrations/github.py:150
+    contract:
+      method: "GitHub REST PR, files, and check-runs"
+      path: "https://api.github.com/repos/{owner}/{repo}/pulls/{number}"
+      request: "read-only authenticated requests"
+      response: "PR head, author, changed files, and check-run evidence"
+    semantic_divergence: "Missing or pending checks fail closed as retryable verification."

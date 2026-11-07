@@ -1,0 +1,9 @@
+unit: demo-cli
+bindings:
+  - type: convention
+    name: "run_demo"
+    source_loc: scripts/demo_cli.py:18
+    target: scripts.demo_cli.run_demo
+    must_appear_in_target: true
+    notes: "Manual CLI demonstration entry point."
+runtime_config: []

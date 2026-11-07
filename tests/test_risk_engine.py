@@ -3,9 +3,9 @@ test_risk_engine.py: Unit tests for RiskEngine critical path and blast radius an
 """
 
 import pytest
-from database import init_db, get_db_writer, TaskRepository
-from coordinator import Coordinator
-from risk_engine import RiskEngine
+from saarathi.database import init_db, get_db_writer, TaskRepository
+from saarathi.core.coordinator import Coordinator
+from saarathi.core.risk_engine import RiskEngine
 
 TEST_RISK_DB = "test_risk.db"
 

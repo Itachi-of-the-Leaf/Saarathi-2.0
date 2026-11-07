@@ -1,5 +1,5 @@
 """
-proof_gate.py: Read-only GitHub REST API client, POSIX glob path matcher,
+saarathi.integrations.github: Read-only GitHub REST API client, POSIX glob path matcher,
 CI check-run inspector, and TOCTOU freshness guard for Saarathi Zero-Trust Auditor.
 Strictly adheres to LLD 2 & LLD 3.
 """
@@ -215,6 +215,13 @@ class GitHubVerifier:
                     reason=f"GitHub access denied or rate limited ({resp.status_code}): {resp.text}",
                     error_type="RateLimit" if resp.status_code == 403 else "GitHubTransient",
                 )
+            if resp.status_code == 429:
+                retry_after = resp.headers.get("Retry-After")
+                return RetryableFailure(
+                    reason="GitHub API rate limit exceeded",
+                    error_type="RateLimit",
+                    retry_after_seconds=int(retry_after) if retry_after and retry_after.isdigit() else 60,
+                )
             if resp.status_code >= 500:
                 return RetryableFailure(
                     reason=f"GitHub API server error ({resp.status_code})",
@@ -347,6 +354,19 @@ class GitHubVerifier:
                 verified_at=datetime.now(timezone.utc).isoformat(),
             )
 
+        except httpx.TimeoutException:
+            return RetryableFailure(
+                reason="GitHub API request timed out",
+                error_type="GitHubTransient",
+                retry_after_seconds=30,
+            )
+        except httpx.HTTPError as exc:
+            logger.warning("GitHub API transport error: %s", exc)
+            return RetryableFailure(
+                reason="GitHub API request failed; retry later",
+                error_type="GitHubTransient",
+                retry_after_seconds=30,
+            )
         finally:
             if own_client:
                 await http.aclose()

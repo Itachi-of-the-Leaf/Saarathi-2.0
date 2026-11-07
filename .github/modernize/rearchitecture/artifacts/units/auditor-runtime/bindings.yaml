@@ -1,0 +1,21 @@
+unit: auditor-runtime
+bindings:
+  - type: convention
+    name: "async main"
+    source_loc: saarathi/services/auditor.py:1537
+    target: "saarathi.services.auditor.main"
+    must_appear_in_target: true
+    notes: "Runtime entry point for three concurrent loops."
+runtime_config:
+  - key: SQLITE_DB_PATH
+    source_loc: saarathi/services/auditor.py:52
+    source: env
+    default_value: saarathi.db
+    must_appear_in_target: true
+    notes: "SQLite database path."
+  - key: SWITCH_BASE_URL
+    source_loc: saarathi/services/auditor.py:48
+    source: env
+    default_value: "https://api.switch.example.com"
+    must_appear_in_target: true
+    notes: "Switch API base URL."

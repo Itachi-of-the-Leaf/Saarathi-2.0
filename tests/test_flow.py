@@ -10,20 +10,20 @@ import sqlite3
 import httpx
 import pytest
 
-from database import (
+from saarathi.database import (
     init_db,
     get_db_writer,
     get_db_reader,
     TaskRepository,
 )
-from proof_gate import GitHubVerifier
-from coordinator import (
+from saarathi.integrations.github import GitHubVerifier
+from saarathi.core.coordinator import (
     Coordinator,
     AuthorizationError,
     DependencyCycleError,
     InvalidStateTransitionError,
 )
-from main import AuditorEngine, parse_conversational_intent
+from saarathi.services.auditor import AuditorEngine, parse_conversational_intent
 
 SMOKE_DB = "smoke_saarathi.db"
 

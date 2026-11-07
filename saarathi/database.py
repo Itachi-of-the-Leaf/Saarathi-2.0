@@ -1,5 +1,5 @@
 """
-database.py: Database schema, WAL pragmas, serialization lock, triggers,
+saarathi.database: Database schema, WAL pragmas, serialization lock, triggers,
 and repository methods for Saarathi Zero-Trust Auditor based on LLD 1 & LLD 3.
 """
 
@@ -337,6 +337,8 @@ CREATE TABLE IF NOT EXISTS outbox (
     idempotency_key TEXT NOT NULL UNIQUE,
     room_id TEXT NOT NULL,
     body TEXT NOT NULL,
+    destination TEXT NOT NULL DEFAULT 'switch',
+    destination_json TEXT,
     status TEXT NOT NULL CHECK(status IN
     ('READY','CLAIMED','SENT','DEAD')),
     attempts INTEGER NOT NULL DEFAULT 0,
@@ -435,6 +437,8 @@ async def init_db(
             ("members", "unavailable_until", "TEXT"),
             ("tasks", "due_at", "TEXT"),
             ("tasks", "last_reminded_tier", "INTEGER NOT NULL DEFAULT 0"),
+            ("outbox", "destination", "TEXT NOT NULL DEFAULT 'switch'"),
+            ("outbox", "destination_json", "TEXT"),
         ]:
             tbl, col, col_type = col_def
             try:
@@ -486,6 +490,29 @@ class TaskRepository:
             )
             row = await cursor.fetchone()
             return dict(row) if row else None
+
+    async def list_tasks(
+        self,
+        room_id: str,
+        status: Optional[str] = None,
+        owner_member_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """List authoritative task records for a room with optional filters."""
+        clauses = ["room_id = ?"]
+        params: List[Any] = [room_id]
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if owner_member_id:
+            clauses.append("owner_member_id = ?")
+            params.append(owner_member_id)
+
+        async with get_db_reader(self.db_path) as db:
+            cursor = await db.execute(
+                f"SELECT * FROM tasks WHERE {' AND '.join(clauses)} ORDER BY created_at ASC",
+                params,
+            )
+            return [dict(row) for row in await cursor.fetchall()]
 
     async def get_task_delegates(self, task_id: str) -> List[str]:
         """Fetch member_ids of delegates for a task."""
@@ -769,6 +796,7 @@ class TaskRepository:
         snapshot: Dict[str, Any],
         inbox_event_key: Optional[Tuple[str, str]] = None,
         outbox_body: Optional[str] = None,
+        outbox_destination: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Atomic completion transaction from LLD 2 & LLD 3:
@@ -922,11 +950,20 @@ class TaskRepository:
             await conn.execute(
                 """
                 INSERT INTO outbox (
-                    outbox_id, idempotency_key, room_id, body,
+                    outbox_id, idempotency_key, room_id, body, destination, destination_json,
                     status, attempts, next_attempt_at, created_at
-                ) VALUES (?, ?, ?, ?, 'READY', 0, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, 'READY', 0, ?, ?)
                 """,
-                (outbox_id, idempotency_key, room_id, body_text, now, now),
+                (
+                    outbox_id,
+                    idempotency_key,
+                    room_id,
+                    body_text,
+                    "slack" if outbox_destination else "switch",
+                    json.dumps(outbox_destination) if outbox_destination else None,
+                    now,
+                    now,
+                ),
             )
 
             # If an inbox event triggered this, mark it DONE
@@ -1047,6 +1084,7 @@ class TaskRepository:
         task_id: str,
         reason: str,
         room_id: Optional[str] = None,
+        outbox_destination: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Record permanent failure: sets attempt to REJECTED and task to REJECTED."""
         async with get_db_writer(self.db_path) as conn:
@@ -1073,11 +1111,20 @@ class TaskRepository:
                 await conn.execute(
                     """
                     INSERT OR IGNORE INTO outbox (
-                        outbox_id, idempotency_key, room_id, body,
+                        outbox_id, idempotency_key, room_id, body, destination, destination_json,
                         status, attempts, next_attempt_at, created_at
-                    ) VALUES (?, ?, ?, ?, 'READY', 0, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'READY', 0, ?, ?)
                     """,
-                    (outbox_id, idempotency_key, room_id, body, now, now),
+                    (
+                        outbox_id,
+                        idempotency_key,
+                        room_id,
+                        body,
+                        "slack" if outbox_destination else "switch",
+                        json.dumps(outbox_destination) if outbox_destination else None,
+                        now,
+                        now,
+                    ),
                 )
 
             return "REJECTED"

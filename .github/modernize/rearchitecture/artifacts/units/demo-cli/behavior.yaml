@@ -1,0 +1,14 @@
+unit: demo-cli
+side_effects:
+  - source_loc: scripts/demo_cli.py:18
+    effect: "creates a disposable local database and demonstrates task/proof lifecycle"
+    must_preserve: true
+branches: []
+error_paths: []
+concurrency:
+  model: coroutine
+  tx_boundary:
+    source_loc: saarathi/database.py:81
+    scope: "demo setup writes are committed through the database writer context"
+    isolation: "SQLite BEGIN IMMEDIATE"
+    must_preserve: true

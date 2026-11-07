@@ -1,0 +1,34 @@
+units:
+  - name: auditor-runtime
+    trigger: cli
+    trigger_detail: "python -m saarathi or python main.py"
+    source_anchors:
+      - path: saarathi/services/auditor.py
+        line: 1537
+    exported_signature:
+      - method: "async main() -> None"
+        source_loc: "saarathi/services/auditor.py:1537"
+        stability: must_preserve
+    dynamic_entrypoints: []
+    depends_on:
+      - unit: database
+        via: "database contexts and TaskRepository"
+      - unit: github-proof
+        via: "GitHubVerifier"
+    shared_refs:
+      - module: database
+        used_fields: [schema, writer_context, reader_context, task_repository]
+  - name: demo-cli
+    trigger: cli
+    trigger_detail: "python -m scripts.demo_cli"
+    source_anchors:
+      - path: scripts/demo_cli.py
+        line: 18
+    exported_signature: []
+    dynamic_entrypoints: []
+    depends_on:
+      - unit: database
+        via: "init_db and TaskRepository"
+      - unit: github-proof
+        via: "mocked GitHubVerifier"
+    shared_refs: []

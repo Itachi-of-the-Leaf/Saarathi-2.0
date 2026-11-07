@@ -32,5 +32,5 @@ jobs:
 
       - name: Run End-to-End Smoke Test
         run: |
-          python test_flow.py
+          python -m tests.test_flow
 

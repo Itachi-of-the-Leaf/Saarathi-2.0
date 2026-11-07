@@ -1,0 +1,10 @@
+unit: auditor-runtime
+commit: false
+candidate_splits:
+  - id: saarathi/services/auditor.py:635-1536
+    drivers: [concern_split, execution_model_split]
+    rationale: >
+      The runtime service contains inbound event listening, command workflow
+      handling, outbox dispatch, and periodic scheduling with separate retry
+      and lifecycle concerns.
+    source_slice: {file: saarathi/services/auditor.py, lines: [635, 1536]}

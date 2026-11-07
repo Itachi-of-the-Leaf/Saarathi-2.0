@@ -1,0 +1,18 @@
+modules:
+  - name: database
+    path: saarathi/database.py
+    used_by_units: [auditor-runtime, demo-cli]
+    fields:
+      - name: schema
+      - name: writer_context
+      - name: reader_context
+      - name: task_repository
+    migration_strategy: "Keep one persistence boundary; do not duplicate schema or repository logic."
+  - name: github-proof
+    path: saarathi/integrations/github.py
+    used_by_units: [auditor-runtime, demo-cli]
+    fields:
+      - name: GitHubVerifier
+      - name: VerificationInput
+      - name: VerifiedSnapshot
+    migration_strategy: "Use the single adapter and inject mocked transports in tests."

@@ -1,5 +1,5 @@
 """
-coordinator.py: Core Coordinator managing dual state machines (Task + Proof),
+saarathi.core.coordinator: Core Coordinator managing dual state machines (Task + Proof),
 Atomic CAS version increments, recursive CTE cycle detection, and role-based authority.
 Adheres strictly to LLD 1, LLD 2, and LLD 3.
 """
@@ -12,7 +12,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from database import (
+from ..database import (
     DEFAULT_DB_PATH,
     DEFAULT_POLICY_ID,
     TaskRepository,
@@ -20,7 +20,7 @@ from database import (
     get_db_writer,
     utc_now_iso,
 )
-from proof_gate import (
+from ..integrations.github import (
     GitHubVerifier,
     PermanentFailure,
     RetryableFailure,
@@ -55,6 +55,12 @@ class Coordinator:
         self.db_path = db_path
         self.repo = TaskRepository(db_path)
         self.verifier = verifier or GitHubVerifier()
+
+    async def authorize_actor(
+        self, room_id: str, actor_switch_id: str
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Validate a caller for read-only or command-oriented integrations."""
+        return await self._resolve_actor_authority(room_id, actor_switch_id)
 
     async def _resolve_actor_authority(
         self, room_id: str, actor_switch_id: str
@@ -453,6 +459,29 @@ class Coordinator:
         except ValueError as e:
             raise DependencyCycleError(str(e)) from e
 
+    async def assign_task(
+        self,
+        room_id: str,
+        actor_switch_id: str,
+        task_id: str,
+        new_owner_id: str,
+        source_event_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Assign a task through the coordinator's lead-only authorization boundary."""
+        actor, membership = await self._resolve_actor_authority(room_id, actor_switch_id)
+        if membership["role"] != "lead":
+            raise AuthorizationError("Only a room lead may assign tasks.")
+        task = await self.repo.get_task(task_id)
+        if not task or task["room_id"] != room_id:
+            raise ValueError(f"Task '{task_id}' not found in room '{room_id}'.")
+        return await self.repo.reassign_task(
+            room_id,
+            task_id,
+            new_owner_id,
+            actor_id=actor["member_id"],
+            source_event_id=source_event_id,
+        )
+
     async def submit_proof(
         self,
         room_id: str,
@@ -461,6 +490,7 @@ class Coordinator:
         pr_url: str,
         source_event_id: Optional[str] = None,
         inbox_event_key: Optional[Tuple[str, str]] = None,
+        outbox_destination: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Execute the complete Proof-Gated Completion workflow from LLD 2 & LLD 3:
@@ -582,6 +612,7 @@ class Coordinator:
             commit_res = await self.repo.finalize_success(
                 snapshot=result.model_dump(),
                 inbox_event_key=inbox_event_key,
+                outbox_destination=outbox_destination,
             )
 
             if commit_res == "COMMITTED":
@@ -590,7 +621,13 @@ class Coordinator:
                     "status": "VERIFIED",
                     "task_id": task_id,
                     "attempt_id": attempt_id,
-                    "sha": result.head_sha,
+                    "repo_full_name": result.repo_full_name,
+                    "pr_number": result.pr_number,
+                    "author_login": result.author_login,
+                    "head_sha": result.head_sha,
+                    "changed_paths": result.changed_paths,
+                    "selected_checks": result.selected_checks,
+                    "verified_at": result.verified_at,
                 }
             elif commit_res == "CONFLICT":
                 logger.warning("CAS conflict occurred for task %s; attempt superseded", task_id)
@@ -627,6 +664,7 @@ class Coordinator:
                 task_id=task_id,
                 reason=result.reason,
                 room_id=room_id,
+                outbox_destination=outbox_destination,
             )
             return {
                 "status": "REJECTED",

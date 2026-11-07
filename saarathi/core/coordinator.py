@@ -166,6 +166,59 @@ class Coordinator:
         logger.info("Task %s created by %s in room %s", tid, actor["member_id"], room_id)
         return tid
 
+    async def schedule_deadline(
+        self,
+        room_id: str,
+        actor_switch_id: str,
+        task_id: str,
+        due_at: str,
+        source_event_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Set a task deadline through the authorized, audited state boundary."""
+        actor, membership = await self._resolve_actor_authority(room_id, actor_switch_id)
+        task = await self.repo.get_task(task_id)
+        if not task or task["room_id"] != room_id:
+            raise ValueError(f"Task '{task_id}' not found in room '{room_id}'.")
+        if task["status"] == "COMPLETE":
+            raise InvalidStateTransitionError("Completed tasks cannot be rescheduled.")
+        if task["owner_member_id"] != actor["member_id"] and membership["role"] != "lead":
+            raise AuthorizationError("Only the task owner or a room lead may schedule a deadline.")
+
+        now = utc_now_iso()
+        new_version = task["version"] + 1
+        async with get_db_writer(self.db_path) as conn:
+            cur = await conn.execute(
+                """
+                UPDATE tasks
+                SET due_at = ?, version = ?, updated_at = ?
+                WHERE task_id = ? AND room_id = ? AND version = ?
+                """,
+                (due_at, new_version, now, task_id, room_id, task["version"]),
+            )
+            if cur.rowcount == 0:
+                raise InvalidStateTransitionError("Concurrent update detected; deadline was not changed.")
+            event_id = f"evt_{uuid.uuid4().hex[:12]}"
+            await conn.execute(
+                """
+                INSERT INTO task_events (
+                    task_id, task_version, event_id, kind,
+                    actor_member_id, source_room_id, source_event_id,
+                    details_json, created_at
+                ) VALUES (?, ?, ?, 'TASK_DEADLINE_UPDATED', ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    new_version,
+                    event_id,
+                    actor["member_id"],
+                    room_id,
+                    source_event_id,
+                    json.dumps({"due_at": due_at}),
+                    now,
+                ),
+            )
+        return {"task_id": task_id, "due_at": due_at, "version": new_version}
+
     async def start_task(
         self,
         room_id: str,

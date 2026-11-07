@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import os
 import json
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -13,7 +14,11 @@ from database import TaskRepository, get_db_reader, init_db, DEFAULT_DB_PATH
 from coordinator import Coordinator
 from risk_engine import RiskEngine
 
-DB_PATH = os.getenv("SQLITE_DB_PATH", DEFAULT_DB_PATH)
+REPO_ROOT = Path(__file__).parent.resolve()
+DEFAULT_DB_PATH = os.getenv("SQLITE_DB_PATH") or str(REPO_ROOT / "saarathi.db")
+if not os.path.isabs(DEFAULT_DB_PATH):
+    DEFAULT_DB_PATH = str(REPO_ROOT / DEFAULT_DB_PATH)
+DB_PATH = DEFAULT_DB_PATH
 
 
 class SaarathiToolBridge:

@@ -12,6 +12,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 import aiosqlite
@@ -21,7 +22,10 @@ load_dotenv()
 
 logger = logging.getLogger("saarathi.database")
 
-DEFAULT_DB_PATH = os.getenv("SQLITE_DB_PATH", "saarathi.db")
+REPO_ROOT = Path(__file__).parent.resolve()
+DEFAULT_DB_PATH = os.getenv("SQLITE_DB_PATH") or str(REPO_ROOT / "saarathi.db")
+if not os.path.isabs(DEFAULT_DB_PATH):
+    DEFAULT_DB_PATH = str(REPO_ROOT / DEFAULT_DB_PATH)
 DEFAULT_POLICY_ID = os.getenv("DEFAULT_POLICY_ID", "default_policy")
 DEFAULT_REPO = os.getenv("GITHUB_REPO", "switch-org/switch-core")
 DEFAULT_ROOM_ID = os.getenv("SWITCH_ROOM_ID", "room_switch_demo")

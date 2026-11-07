@@ -1,93 +1,122 @@
 """
-auto_switch.py: Auto-discovery helper for Switch Console environments.
-Automatically detects running Switch server ports, rooms, and agent tokens on the host
-so judges and developers do not need to manually decrypt database credentials.
+auto_switch.py: Auto-discovery and unified configuration engine for Saarathi 2.0.
+Auto-detects Switch Console ports, tokens, and sets a canonical database path.
 """
 import os
 import re
 import sys
 import json
-from typing import Dict, Optional
+from pathlib import Path
+from typing import Dict, Any
 
-def auto_discover_switch_config() -> Dict[str, str]:
-    config = {}
+REPO_ROOT = Path(__file__).parent.resolve()
+DEFAULT_DB_FILE = REPO_ROOT / "saarathi.db"
+
+def discover_switch_environment() -> Dict[str, str]:
+    discovered = {
+        "SQLITE_DB_PATH": str(DEFAULT_DB_FILE),
+    }
+
+    # 1. Search for Switch Console native configuration
     appdata = os.getenv("APPDATA", "")
-    switch_native_dir = os.path.join(appdata, "switchdash", "local-switch-server", "native", "run")
-    env_path = os.path.join(switch_native_dir, "switch-core.env")
+    switch_run_dir = Path(appdata) / "switchdash" / "local-switch-server" / "native" / "run"
+    core_env = switch_run_dir / "switch-core.env"
 
-    # 1. Detect server port from switch-core.env
-    if os.path.exists(env_path):
+    if core_env.exists():
         try:
-            with open(env_path, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
-                m_port = re.search(r"SERVER_PORT=(\d+)", content)
-                if m_port:
-                    config["SWITCH_BASE_URL"] = f"http://127.0.0.1:{m_port.group(1)}"
+            content = core_env.read_text(encoding="utf-8", errors="ignore")
+            port_match = re.search(r"SERVER_PORT=(\d+)", content)
+            if port_match:
+                discovered["SWITCH_BASE_URL"] = f"http://127.0.0.1:{port_match.group(1)}"
+            
+            # Check for tokens
+            reg_match = re.search(r"AGENT_REGISTRATION_TOKEN=([^\r\n]+)", content)
+            if reg_match and reg_match.group(1).strip():
+                discovered["SWITCH_TOKEN"] = reg_match.group(1).strip()
         except Exception:
             pass
 
-    # 2. Look for any active agent credential files in ~/.switch/agents
-    agents_dir = os.path.join(os.getenv("USERPROFILE", ""), ".switch", "agents")
-    if os.path.exists(agents_dir):
-        for root, _, files in os.walk(agents_dir):
-            for file in files:
-                if file.endswith(".json") and "token" in file.lower():
-                    try:
-                        with open(os.path.join(root, file), "r", encoding="utf-8", errors="ignore") as f:
-                            data = json.load(f)
-                            if "token" in data:
-                                config["SWITCH_TOKEN"] = data["token"]
-                                break
-                    except Exception:
-                        continue
+    # 2. Check for active agent credentials in ~/.switch
+    user_profile = Path(os.getenv("USERPROFILE", ""))
+    switch_agents_dir = user_profile / ".switch" / "agents"
+    if switch_agents_dir.exists():
+        for token_file in switch_agents_dir.rglob("*.json"):
+            if "token" in token_file.name.lower():
+                try:
+                    data = json.loads(token_file.read_text(encoding="utf-8", errors="ignore"))
+                    if "token" in data and not discovered.get("SWITCH_TOKEN"):
+                        discovered["SWITCH_TOKEN"] = data["token"]
+                        break
+                except Exception:
+                    continue
 
-    # 3. Look for agent controller credentials in AppData switchdash
-    if "SWITCH_TOKEN" not in config and appdata:
-        controller_dir = os.path.join(appdata, "switchdash", "agent-controller")
-        if os.path.exists(controller_dir):
-            for root, _, files in os.walk(controller_dir):
-                for file in files:
-                    if file == "credentials.json":
-                        try:
-                            with open(os.path.join(root, file), "r", encoding="utf-8", errors="ignore") as f:
-                                data = json.load(f)
-                                tok = data.get("SWITCH_API_TOKEN") or data.get("token")
-                                if tok:
-                                    config["SWITCH_TOKEN"] = tok
-                                    break
-                        except Exception:
-                            continue
+    # 3. Check for active agent credentials in AppData switchdash
+    if not discovered.get("SWITCH_TOKEN") and appdata:
+        controller_dir = Path(appdata) / "switchdash" / "agent-controller"
+        if controller_dir.exists():
+            for cred_file in controller_dir.rglob("credentials.json"):
+                try:
+                    data = json.loads(cred_file.read_text(encoding="utf-8", errors="ignore"))
+                    tok = data.get("SWITCH_API_TOKEN") or data.get("token")
+                    if tok:
+                        discovered["SWITCH_TOKEN"] = tok
+                        break
+                except Exception:
+                    continue
 
-    return config
+    return discovered
 
-def sync_to_env_file(config: Dict[str, str], env_path: str = ".env") -> None:
-    """Writes discovered Switch settings directly into .env so the user doesn't have to."""
+# Backward-compatibility alias
+auto_discover_switch_config = discover_switch_environment
+
+def sync_env_file(config: Dict[str, str], env_filename: str = ".env") -> Dict[str, str]:
+    env_path = REPO_ROOT / env_filename
     existing = {}
-    if os.path.exists(env_path):
-        with open(env_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, v = line.split("=", 1)
-                    existing[k.strip()] = v.strip()
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                existing[k.strip()] = v.strip()
 
-    updated = False
+    # Fill in discovered keys only if not already populated
     for k, v in config.items():
-        # Only populate if currently empty or missing
         if not existing.get(k):
             existing[k] = v
-            updated = True
 
-    if updated:
-        with open(env_path, "w", encoding="utf-8") as f:
-            for k, v in existing.items():
-                f.write(f"{k}={v}\n")
-        print(f"✓ Automatically populated {env_path} with discovered Switch values!")
+    # Guarantee canonical absolute path for SQLite database
+    if existing.get("SQLITE_DB_PATH") and not os.path.isabs(existing["SQLITE_DB_PATH"]):
+        existing["SQLITE_DB_PATH"] = str(REPO_ROOT / existing["SQLITE_DB_PATH"])
+    elif not existing.get("SQLITE_DB_PATH"):
+        existing["SQLITE_DB_PATH"] = str(DEFAULT_DB_FILE)
+
+    # Write back clean .env
+    lines = [
+        "# Saarathi 2.0 Unified Configuration (Auto-Generated)",
+        f"SQLITE_DB_PATH={existing.get('SQLITE_DB_PATH', str(DEFAULT_DB_FILE))}",
+        f"SWITCH_BASE_URL={existing.get('SWITCH_BASE_URL', 'http://127.0.0.1:51313')}",
+        f"SWITCH_TOKEN={existing.get('SWITCH_TOKEN', '')}",
+        f"SWITCH_ROOM_ID={existing.get('SWITCH_ROOM_ID', '')}",
+        f"AGENT_ID={existing.get('AGENT_ID', 'saarathi-auditor')}",
+        "",
+        "# GitHub Configuration",
+        f"GITHUB_TOKEN={existing.get('GITHUB_TOKEN', '')}",
+        f"GITHUB_REPO={existing.get('GITHUB_REPO', 'Itachi-of-the-Leaf/Saarathi-2.0')}",
+        "",
+        "# LLM Intake (Optional)",
+        f"OPENAI_API_BASE={existing.get('OPENAI_API_BASE', 'https://openrouter.ai/api/v1')}",
+        f"OPENAI_API_KEY={existing.get('OPENAI_API_KEY', '')}",
+        f"LLM_MODEL={existing.get('LLM_MODEL', 'openai/gpt-4o-mini')}",
+    ]
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return existing
+
+# Backward-compatibility alias
+sync_to_env_file = sync_env_file
 
 if __name__ == "__main__":
-    cfg = auto_discover_switch_config()
-    print("Auto-discovered Switch settings:")
-    for k, v in cfg.items():
-        print(f"  {k}={v}")
-    sync_to_env_file(cfg)
-
+    discovered = discover_switch_environment()
+    synced = sync_env_file(discovered)
+    print("✓ Successfully synchronized .env with unified configuration:")
+    for k in ["SQLITE_DB_PATH", "SWITCH_BASE_URL", "SWITCH_ROOM_ID"]:
+        print(f"  {k} = {synced.get(k)}")

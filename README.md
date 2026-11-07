@@ -29,6 +29,13 @@ pytest -v
 
 Saarathi includes auto-discovery via `auto_switch.py`. When Switch Console is running, `python main.py` automatically detects your local port. Copy your room URL from Switch Console into `SWITCH_ROOM_ID` in `.env` and run `python main.py`.
 
+## 🚀 One-Line Setup for Switch Agents
+Once cloned into your workspace, run:
+```bash
+python setup_agent.py
+```
+This auto-detects your local Switch server, links the unified database, and prepares Saarathi for live coordination.
+
 ---
 
 ## 🏛️ Architecture & Design
